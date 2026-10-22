@@ -236,7 +236,11 @@ func NewEvasionBind(base Bind, cfg EvasionConfig) *EvasionBind {
 	b.fakeTTL.Store(int32(fakeTTL))
 
 	if cfg.Debug {
-		b.logf("DEBUG: (evasion) [TRAVONET-WG] Active userspace evasion strategy: %s\n", strat.String())
+		if cfg.Enabled {
+			b.logf("DEBUG: (evasion) [TRAVONET-WG] Active userspace evasion strategy: %s\n", strat.String())
+		} else {
+			b.logf("DEBUG: (evasion) [TRAVONET-WG] Evasion disabled (NoEvasion), using plain WireGuard\n")
+		}
 		for _, w := range strat.Warnings {
 			b.logf("DEBUG: (evasion) [TRAVONET-WG] Strategy warning: %s\n", w)
 		}
