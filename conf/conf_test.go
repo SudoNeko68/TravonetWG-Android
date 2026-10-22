@@ -189,3 +189,35 @@ PersistentKeepalive = 15
 		t.Errorf("expected 2 public_key in ToUAPI, got count %d:\n%s", strings.Count(uapi, "public_key="), uapi)
 	}
 }
+
+func TestConfigEvasionFlags(t *testing.T) {
+	const header = `[Interface]
+PrivateKey = AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
+Address = 172.16.0.2/32
+`
+
+	cfg, err := ParseConfig(strings.NewReader(header))
+	if err != nil {
+		t.Fatalf("ParseConfig: %v", err)
+	}
+	if cfg.DebugSet {
+		t.Error("DebugSet must stay false when the key is absent")
+	}
+	if cfg.NoEvasion {
+		t.Error("NoEvasion must default to false")
+	}
+
+	cfg, err = ParseConfig(strings.NewReader(header + "Debug = false\nNoEvasion = true\n"))
+	if err != nil {
+		t.Fatalf("ParseConfig: %v", err)
+	}
+	if !cfg.DebugSet {
+		t.Error("DebugSet must be true for an explicit Debug key")
+	}
+	if cfg.Debug {
+		t.Error("Debug = false must be recorded as false")
+	}
+	if !cfg.NoEvasion {
+		t.Error("NoEvasion = true must disable the evasion engine")
+	}
+}

@@ -23,14 +23,13 @@ extern void wgNotifySocketProtected(int handle);
 import "C"
 
 import (
-	"bufio"
 	"fmt"
 	"math"
+	"net"
 	"net/netip"
 	"os"
 	"os/signal"
 	"runtime"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -67,7 +66,6 @@ type TunnelHandle struct {
 type Socks5Handle struct {
 	server *proxy.SOCKS5Server
 	device *device.Device
-	bind   *conn.EvasionBind
 }
 
 var (
@@ -110,28 +108,22 @@ func init() {
 	}()
 }
 
-// amneziaWGKeys are UAPI keys produced by AmneziaWG configs that the vanilla
-// WireGuard UAPI parser rejects. They must be dropped (or mapped) before
-// device.IpcSet sees them.
-var amneziaWGKeys = map[string]bool{
-	"jc": true, "jmax": true,
-	"s1": true, "s2": true, "s3": true, "s4": true,
-	"h1": true, "h2": true, "h3": true, "h4": true,
-	"i1": true, "i2": true, "i3": true, "i4": true, "i5": true,
-}
-
-// parseSettings parses incoming configuration (either standard WG .conf or UAPI)
-// and extracts evasion options without breaking the WireGuard UAPI parser.
-func parseSettings(settings string, logger *device.Logger) (cleanUapi string, evasionCfg conn.EvasionConfig, pka int, endpoint string, mtu int, err error) {
+// parseSettings parses incoming configuration (either a standard WireGuard
+// .conf or a UAPI blob) and extracts the evasion options without breaking the
+// WireGuard UAPI parser.
+//
+// PersistentKeepalive is a peer-level UAPI key, so it is kept inside the peer
+// section it belongs to; hoisting a single value to the end of the stream would
+// silently drop the keepalives of all but the last peer.
+func parseSettings(settings string, logger *device.Logger) (cleanUapi string, evasionCfg conn.EvasionConfig, endpoint string, mtu int, err error) {
 	evasionCfg = conn.DefaultEvasionConfig()
 	evasionCfg.LogFunc = logger.Verbosef
 	mtu = 1280
 
-	lower := strings.ToLower(settings)
-	if strings.Contains(lower, "[interface]") {
+	if strings.Contains(strings.ToLower(settings), "[interface]") {
 		parsed, parseErr := conf.ParseConfigString(settings)
 		if parseErr != nil {
-			return "", evasionCfg, 0, "", 0, fmt.Errorf("failed to parse WireGuard .conf: %w", parseErr)
+			return "", evasionCfg, "", 0, fmt.Errorf("failed to parse WireGuard .conf: %w", parseErr)
 		}
 		if parsed.Strategy != "" {
 			evasionCfg.Strategy = parsed.Strategy
@@ -145,130 +137,95 @@ func parseSettings(settings string, logger *device.Logger) (cleanUapi string, ev
 		if parsed.PreJunkSize > 0 {
 			evasionCfg.PreJunkSize = parsed.PreJunkSize
 		}
+		if parsed.NoEvasion {
+			evasionCfg.Enabled = false
+		}
+		if parsed.DebugSet {
+			evasionCfg.Debug = parsed.Debug
+		}
 		if parsed.MTU > 0 {
 			mtu = parsed.MTU
 		}
 
 		uapi, genErr := parsed.ToUAPI()
 		if genErr != nil {
-			return "", evasionCfg, 0, "", 0, fmt.Errorf("failed to generate UAPI: %w", genErr)
+			return "", evasionCfg, "", 0, fmt.Errorf("failed to generate UAPI: %w", genErr)
 		}
-		return uapi, evasionCfg, parsed.PersistentKeepalive, parsed.Endpoint, mtu, nil
+		logger.Verbosef("Parsed .conf settings (strategy=%q, fake_ttl=%d, normal_ttl=%d, pre_junk=%d, evasion=%v, mtu=%d)",
+			evasionCfg.Strategy, evasionCfg.FakeTTL, evasionCfg.NormalTTL, evasionCfg.PreJunkSize, evasionCfg.Enabled, mtu)
+		return uapi, evasionCfg, parsed.Endpoint, mtu, nil
 	}
 
-	// UAPI format - filter custom evasion parameters and AmneziaWG keys.
-	var uapiLines []string
-	inPeerSection := false
-	keepaliveSeen := false
-	scanner := bufio.NewScanner(strings.NewReader(settings))
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, ";") {
-			continue
-		}
-		if strings.HasPrefix(line, "[") && strings.HasSuffix(line, "]") {
-			continue
-		}
-		key, val, ok := strings.Cut(line, "=")
-		if !ok {
-			continue
-		}
-		key = strings.ToLower(strings.TrimSpace(key))
-		val = strings.TrimSpace(val)
+	// UAPI format: filter custom evasion parameters and AmneziaWG keys while
+	// preserving per-peer keepalives.
+	cleanUapi, ev := conf.FilterUAPI(settings)
 
-		if amneziaWGKeys[key] {
-			continue
-		}
-
-		switch key {
-		case "strategy":
-			evasionCfg.Strategy = val
-			continue
-		case "fake_ttl", "fakettl":
-			if strings.EqualFold(val, "auto") {
-				evasionCfg.FakeTTL = -1
-			} else if v, convErr := strconv.Atoi(val); convErr == nil {
-				evasionCfg.FakeTTL = v
-			}
-			continue
-		case "normal_ttl", "normalttl":
-			if v, convErr := strconv.Atoi(val); convErr == nil && v > 0 {
-				evasionCfg.NormalTTL = v
-			}
-			continue
-		case "pre_junk", "prejunk", "prejunksize":
-			if v, convErr := strconv.Atoi(val); convErr == nil {
-				evasionCfg.PreJunkSize = v
-			}
-			continue
-		case "jmin":
-			// AmneziaWG: jmin maps to PreJunkSize when PreJunk is unset.
-			if v, convErr := strconv.Atoi(val); convErr == nil && evasionCfg.PreJunkSize == 0 {
-				evasionCfg.PreJunkSize = v
-			}
-			continue
-		case "no_evasion", "disable_evasion":
-			if strings.EqualFold(val, "true") || val == "1" {
-				evasionCfg.Enabled = false
-			}
-			continue
-		case "mtu":
-			if v, convErr := strconv.Atoi(val); convErr == nil && v > 0 {
-				mtu = v
-			}
-			continue
-		case "endpoint":
-			endpoint = val
-			uapiLines = append(uapiLines, "endpoint="+conf.ResolveEndpointHostPort(val))
-			continue
-		case "public_key":
-			inPeerSection = true
-		case "persistent_keepalive_interval", "persistentkeepalive":
-			if v, convErr := strconv.Atoi(val); convErr == nil {
-				pka = v
-				keepaliveSeen = true
-			}
-			continue
-		}
-
-		uapiLines = append(uapiLines, line)
+	if ev.HasStrategy {
+		evasionCfg.Strategy = ev.Strategy
+	}
+	if ev.HasFakeTTL {
+		evasionCfg.FakeTTL = ev.FakeTTL
+	}
+	if ev.HasNormalTTL {
+		evasionCfg.NormalTTL = ev.NormalTTL
+	}
+	if ev.HasPreJunkSize {
+		evasionCfg.PreJunkSize = ev.PreJunkSize
+	}
+	if ev.HasEnabled {
+		evasionCfg.Enabled = ev.Enabled
+	}
+	if ev.HasDebug {
+		evasionCfg.Debug = ev.Debug
+	}
+	if ev.HasMTU {
+		mtu = ev.MTU
 	}
 
-	// Automatic PersistentKeepalive optimization for Android mobile networks.
-	if inPeerSection {
-		if conf.IsPort500Endpoint(endpoint) {
-			if pka == 0 || pka > 10 {
-				pka = 5
-			}
-		} else if pka == 0 {
-			pka = 15
-		}
-		if pka > 0 {
-			uapiLines = append(uapiLines, fmt.Sprintf("persistent_keepalive_interval=%d", pka))
-		}
-	} else if !keepaliveSeen {
-		pka = 0
-	}
+	logger.Verbosef("Parsed UAPI settings (strategy=%q, fake_ttl=%d, normal_ttl=%d, pre_junk=%d, evasion=%v, keepalive=%ds, mtu=%d)",
+		evasionCfg.Strategy, evasionCfg.FakeTTL, evasionCfg.NormalTTL, evasionCfg.PreJunkSize, evasionCfg.Enabled, ev.PersistentKeepalive, mtu)
 
-	cleanUapi = strings.Join(uapiLines, "\n") + "\n"
-	return cleanUapi, evasionCfg, pka, endpoint, mtu, nil
+	return cleanUapi, evasionCfg, ev.Endpoint, mtu, nil
 }
 
-// resolveAutoFakeTTL runs the kernel-assisted TTL probe when FakeTTL=auto.
-func resolveAutoFakeTTL(evasionCfg *conn.EvasionConfig, endpoint string, logger *device.Logger) {
-	if evasionCfg.FakeTTL >= 0 || endpoint == "" {
+// startAutoFakeTTLProbe resolves FakeTTL=auto in the background.
+//
+// The kernel-assisted probe can take up to ~0.7s and performs a DNS lookup.
+// Blocking wgTurnOn on it would freeze the Java caller thread (ANR) and delay
+// the whole tunnel, so decoys start with the safe platform fallback and are
+// refined as soon as the probe finishes: the compiled strategy resolves its
+// decoy TTL at send time, so no restart is needed.
+func startAutoFakeTTLProbe(bind *conn.EvasionBind, endpoint string, logger *device.Logger) {
+	if bind == nil || endpoint == "" {
 		return
 	}
-	hops, recommended, probeErr := conn.MeasureTargetTTL(endpoint)
-	if recommended <= 0 {
-		recommended = 5
+	go func() {
+		hops, recommended, probeErr := conn.MeasureTargetTTL(endpoint)
+		if recommended > 0 {
+			bind.SetFakeTTL(recommended)
+		}
+		if probeErr != nil {
+			logger.Verbosef("AutoTTL probe failed (%v), keeping safe FakeTTL=%d", probeErr, bind.FakeTTL())
+			return
+		}
+		logger.Verbosef("AutoTTL: measured %d hops, using FakeTTL=%d", hops, bind.FakeTTL())
+	}()
+}
+
+// isLoopbackListenAddr reports whether a listen address is only reachable from
+// the device itself. An empty host means "all interfaces" and is not loopback.
+func isLoopbackListenAddr(addr string) bool {
+	host, _, splitErr := net.SplitHostPort(addr)
+	if splitErr != nil {
+		return false
 	}
-	evasionCfg.FakeTTL = recommended
-	if probeErr != nil {
-		logger.Verbosef("AutoTTL probe failed (%v), using safe FakeTTL=%d", probeErr, recommended)
-	} else {
-		logger.Verbosef("AutoTTL: measured %d hops, using FakeTTL=%d", hops, recommended)
+	if host == "" {
+		return false
 	}
+	if ip, parseErr := netip.ParseAddr(host); parseErr == nil {
+		return ip.IsLoopback()
+	}
+	return strings.EqualFold(host, "localhost")
 }
 
 //export wgTurnOn
@@ -279,13 +236,13 @@ func wgTurnOn(interfaceName string, tunFd int32, settings string) int32 {
 		Errorf:   AndroidLogger{level: C.ANDROID_LOG_ERROR, tag: tag}.Printf,
 	}
 
-	cleanUapi, evasionCfg, pka, endpoint, mtu, err := parseSettings(settings, logger)
+	cleanUapi, evasionCfg, endpoint, mtu, err := parseSettings(settings, logger)
 	if err != nil {
 		unix.Close(int(tunFd))
 		logger.Errorf("parseSettings error: %v", err)
 		return -1
 	}
-	resolveAutoFakeTTL(&evasionCfg, endpoint, logger)
+	autoFakeTTL := evasionCfg.FakeTTL < 0
 
 	tunDev, name, err := tun.CreateUnmonitoredTUNFromFD(int(tunFd))
 	if err != nil {
@@ -298,8 +255,8 @@ func wgTurnOn(interfaceName string, tunFd int32, settings string) int32 {
 		mtu = actualMTU
 	}
 
-	logger.Verbosef("Attaching to interface %v (strategy=%s, fake_ttl=%d, keepalive=%ds, mtu=%d)",
-		name, evasionCfg.Strategy, evasionCfg.FakeTTL, pka, mtu)
+	logger.Verbosef("Attaching to interface %v (strategy=%s, fake_ttl=%d, mtu=%d, evasion=%v)",
+		name, evasionCfg.Strategy, evasionCfg.FakeTTL, mtu, evasionCfg.Enabled)
 
 	evasionBind := conn.NewEvasionBind(conn.NewStdNetBind(), evasionCfg)
 	dev := device.NewDevice(tunDev, evasionBind, logger)
@@ -326,6 +283,10 @@ func wgTurnOn(interfaceName string, tunFd int32, settings string) int32 {
 		return -1
 	}
 	dev.DisableSomeRoamingForBrokenMobileSemantics()
+
+	if autoFakeTTL {
+		startAutoFakeTTLProbe(evasionBind, endpoint, logger)
+	}
 
 	logger.Verbosef("TravonetWG device started")
 
@@ -453,12 +414,12 @@ func wgStartSocks5(listenAddr string, settings string) int32 {
 		Errorf:   AndroidLogger{level: C.ANDROID_LOG_ERROR, tag: tag}.Printf,
 	}
 
-	cleanUapi, evasionCfg, pka, endpoint, mtu, err := parseSettings(settings, logger)
+	cleanUapi, evasionCfg, endpoint, mtu, err := parseSettings(settings, logger)
 	if err != nil {
 		logger.Errorf("parseSettings error: %v", err)
 		return -1
 	}
-	resolveAutoFakeTTL(&evasionCfg, endpoint, logger)
+	autoFakeTTL := evasionCfg.FakeTTL < 0
 
 	var localIPs []netip.Addr
 	var dnsIPs []netip.Addr
@@ -492,6 +453,22 @@ func wgStartSocks5(listenAddr string, settings string) int32 {
 		dnsIPs = []netip.Addr{netip.MustParseAddr("1.1.1.1")}
 	}
 
+	// Validate the proxy exposure before allocating any tunnel resources.
+	var socksUser, socksPass string
+	haveSocksAuth := false
+	if socksAuth != "" {
+		user, pass, cutOK := strings.Cut(socksAuth, ":")
+		if !cutOK || user == "" || pass == "" {
+			logger.Errorf("Invalid SocksAuth (expected USER:PASS)")
+			return -1
+		}
+		socksUser, socksPass, haveSocksAuth = user, pass, true
+	}
+	if !isLoopbackListenAddr(listenAddr) && !haveSocksAuth {
+		logger.Errorf("Refusing to expose the SOCKS5 proxy on %s without authentication; set SocksAuth = USER:PASS", listenAddr)
+		return -1
+	}
+
 	tunDev, tnet, err := netstack.CreateNetTUN(localIPs, dnsIPs, mtu)
 	if err != nil {
 		logger.Errorf("CreateNetTUN: %v", err)
@@ -515,24 +492,32 @@ func wgStartSocks5(listenAddr string, settings string) int32 {
 	}
 	dev.DisableSomeRoamingForBrokenMobileSemantics()
 
-	socksServer := proxy.NewSOCKS5Server(listenAddr, tnet.DialContext)
-	socksServer.Debug = true
-	if socksAuth != "" {
-		if user, pass, ok := strings.Cut(socksAuth, ":"); ok {
-			socksServer.SetAuth(user, pass)
-			logger.Verbosef("SOCKS5 authentication enabled for user '%s'", user)
-		} else {
-			logger.Errorf("Invalid SocksAuth format: %s (expected USER:PASS)", socksAuth)
-		}
+	if autoFakeTTL {
+		startAutoFakeTTLProbe(evasionBind, endpoint, logger)
 	}
 
+	socksServer := proxy.NewSOCKS5Server(listenAddr, tnet.DialContext)
+	socksServer.Debug = evasionCfg.Debug
+	socksServer.Logf = logger.Verbosef
+	if haveSocksAuth {
+		socksServer.SetAuth(socksUser, socksPass)
+		logger.Verbosef("SOCKS5 authentication enabled")
+	}
+
+	// Bind synchronously so a busy port is reported to the caller instead of
+	// being discovered asynchronously in a goroutine.
+	if listenErr := socksServer.Listen(); listenErr != nil {
+		logger.Errorf("SOCKS5 listen failed: %v", listenErr)
+		dev.Close()
+		return -1
+	}
 	go func() {
-		if err := socksServer.ListenAndServe(); err != nil && !strings.Contains(err.Error(), "closed") {
-			logger.Errorf("SOCKS5 server: %v", err)
+		if serveErr := socksServer.Serve(); serveErr != nil {
+			logger.Errorf("SOCKS5 server: %v", serveErr)
 		}
 	}()
 
-	logger.Verbosef("SOCKS5 proxy listening on %s (WireGuard peer connected, keepalive: %ds)", listenAddr, pka)
+	logger.Verbosef("SOCKS5 proxy listening on %s (WireGuard peer connected)", socksServer.Addr())
 
 	socksMu.Lock()
 	defer socksMu.Unlock()
@@ -545,7 +530,6 @@ func wgStartSocks5(listenAddr string, settings string) int32 {
 			socksHandles[nextSocksHandle] = &Socks5Handle{
 				server: socksServer,
 				device: dev,
-				bind:   evasionBind,
 			}
 			return nextSocksHandle
 		}

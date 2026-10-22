@@ -48,7 +48,7 @@ func (a ActionType) String() string {
 type Step struct {
 	Action        ActionType
 	Length        int           // Length of the UDP payload for this step
-	TTL           int           // TTL for this packet (0 = default normal TTL)
+	TTL           int           // 0 = engine default: NormalTTL for junk/mimic, live FakeTTL for fake_udp/jumbo_fake
 	SleepDur      time.Duration // Duration for ActionSleep
 	MimicProto    string        // "stun", "quic" or "dns" for ActionMimic
 	IPOptMode     string        // "nop", "ts", "rr" or "none" for IPv4 options
@@ -72,18 +72,26 @@ func (s *Strategy) String() string {
 		case ActionJunk:
 			parts = append(parts, fmt.Sprintf("junk(size=%d)", step.Length))
 		case ActionFakeUDP:
-			parts = append(parts, fmt.Sprintf("fake_udp(size=%d, ttl=%d, corrupt=%v, ipopt=%s)", step.Length, step.TTL, step.CorruptHeader, step.IPOptMode))
+			parts = append(parts, fmt.Sprintf("fake_udp(size=%d, ttl=%s, corrupt=%v, ipopt=%s)", step.Length, formatTTL(step.TTL), step.CorruptHeader, step.IPOptMode))
 		case ActionSleep:
 			parts = append(parts, fmt.Sprintf("sleep(%v)", step.SleepDur))
 		case ActionMimic:
 			parts = append(parts, fmt.Sprintf("mimic(%s)", step.MimicProto))
 		case ActionJumboFake:
-			parts = append(parts, fmt.Sprintf("jumbo_fake(size=%d, ttl=%d)", step.Length, step.TTL))
+			parts = append(parts, fmt.Sprintf("jumbo_fake(size=%d, ttl=%s)", step.Length, formatTTL(step.TTL)))
 		case ActionIPOptShift:
 			parts = append(parts, fmt.Sprintf("ipopt_shift(%d, mode=%s)", step.Length, step.IPOptMode))
 		}
 	}
 	return strings.Join(parts, " -> ")
+}
+
+// formatTTL renders a step TTL for logs. TTL 0 means "resolve at send time".
+func formatTTL(ttl int) string {
+	if ttl <= 0 {
+		return "auto"
+	}
+	return strconv.Itoa(ttl)
 }
 
 // DefaultUserspaceStrategy creates the unprivileged Android desync pipeline.
@@ -92,35 +100,30 @@ func (s *Strategy) String() string {
 //	mimic(quic) -> mimic(stun) -> jumbo_fake(1600) -> fake_udp(148) -> sleep(2ms)
 //
 // The legitimate WireGuard handshake is appended by the caller.
-func DefaultUserspaceStrategy(fakeTTL, normalTTL int) *Strategy {
-	if fakeTTL <= 0 {
-		fakeTTL = 5
-	}
-	if normalTTL <= 0 {
-		normalTTL = 64
-	}
+//
+// Steps are compiled with TTL 0, meaning "resolve at send time": mimic and junk
+// packets use NormalTTL, while fake_udp and jumbo_fake use the bind's live
+// FakeTTL. That is what allows the background AutoTTL probe to refine the TTL
+// of an already running tunnel.
+func DefaultUserspaceStrategy() *Strategy {
 	return &Strategy{
 		Raw: "mimic(quic) -> mimic(stun) -> jumbo_fake(size=1600) -> fake_udp(size=148, ipopt=ts) -> sleep(2ms)",
 		Steps: []Step{
 			{
 				Action:     ActionMimic,
 				MimicProto: "quic",
-				TTL:        normalTTL,
 			},
 			{
 				Action:     ActionMimic,
 				MimicProto: "stun",
-				TTL:        normalTTL,
 			},
 			{
 				Action: ActionJumboFake,
 				Length: 1600,
-				TTL:    fakeTTL,
 			},
 			{
 				Action:        ActionFakeUDP,
 				Length:        WGHandshakeInitiationSize,
-				TTL:           fakeTTL,
 				IPOptMode:     "ts",
 				CorruptHeader: true,
 			},
@@ -136,11 +139,11 @@ func DefaultUserspaceStrategy(fakeTTL, normalTTL int) *Strategy {
 // be executed without CAP_NET_RAW are accepted; raw L3 fragmentation actions
 // are deliberately rejected and cause the caller to fall back to the default
 // userspace pipeline.
-func ParseStrategy(dsl string, defaultFakeTTL, defaultNormalTTL int) (*Strategy, error) {
+func ParseStrategy(dsl string) (*Strategy, error) {
 	clean := strings.TrimSpace(dsl)
 	switch strings.ToLower(clean) {
 	case "", "default", "default-userspace", "userspace", "5packet", "early-term", "ipfrag2", "split2":
-		return DefaultUserspaceStrategy(defaultFakeTTL, defaultNormalTTL), nil
+		return DefaultUserspaceStrategy(), nil
 	case "fake,ipfrag2", "fake,split2", "fake", "fake_udp", "fake_packet":
 		// Old raw-fragmentation aliases degrade to the userspace fake packet.
 		clean = "fake_udp(148)"
@@ -192,7 +195,6 @@ func ParseStrategy(dsl string, defaultFakeTTL, defaultNormalTTL int) (*Strategy,
 			step := Step{
 				Action: ActionJunk,
 				Length: 64,
-				TTL:    defaultNormalTTL,
 			}
 			if szStr, ok := namedArgs["size"]; ok {
 				step.Length, _ = strconv.Atoi(szStr)
@@ -213,7 +215,6 @@ func ParseStrategy(dsl string, defaultFakeTTL, defaultNormalTTL int) (*Strategy,
 			step := Step{
 				Action: ActionFakeUDP,
 				Length: WGHandshakeInitiationSize,
-				TTL:    defaultFakeTTL,
 			}
 			if szStr, ok := namedArgs["size"]; ok {
 				step.Length, _ = strconv.Atoi(szStr)
@@ -242,7 +243,6 @@ func ParseStrategy(dsl string, defaultFakeTTL, defaultNormalTTL int) (*Strategy,
 			step := Step{
 				Action:     ActionMimic,
 				MimicProto: "stun",
-				TTL:        defaultNormalTTL,
 			}
 			if proto, ok := namedArgs["proto"]; ok {
 				step.MimicProto = strings.ToLower(proto)
@@ -263,7 +263,6 @@ func ParseStrategy(dsl string, defaultFakeTTL, defaultNormalTTL int) (*Strategy,
 			step := Step{
 				Action: ActionJumboFake,
 				Length: 1600,
-				TTL:    defaultFakeTTL,
 			}
 			if szStr, ok := namedArgs["size"]; ok {
 				step.Length, _ = strconv.Atoi(szStr)
@@ -347,7 +346,7 @@ func ParseStrategy(dsl string, defaultFakeTTL, defaultNormalTTL int) (*Strategy,
 	}
 
 	if len(steps) == 0 {
-		return DefaultUserspaceStrategy(defaultFakeTTL, defaultNormalTTL), nil
+		return DefaultUserspaceStrategy(), nil
 	}
 
 	return &Strategy{

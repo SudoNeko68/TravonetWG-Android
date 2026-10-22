@@ -81,14 +81,11 @@ func measureTTLViaErrQueue(targetIP net.IP, port int) (int, error) {
 	probe := buildErrQueueProbe()
 	lastRespondingHop := 0
 
-	for ttl := 2; ttl <= 16; ttl++ {
+	for ttl := 2; ttl <= maxProbeTTL; ttl++ {
 		if err := unix.SetsockoptInt(fd, unix.SOL_IP, unix.IP_TTL, ttl); err != nil {
 			return 0, err
 		}
 		if err := unix.Sendto(fd, probe, 0, &sa); err != nil {
-			if errors.Is(err, unix.ENETUNREACH) || errors.Is(err, unix.EHOSTUNREACH) {
-				return 0, err
-			}
 			return 0, err
 		}
 
@@ -100,13 +97,15 @@ func measureTTLViaErrQueue(targetIP net.IP, port int) (int, error) {
 			return 0, pollErr
 		}
 		if reached {
-			if ttl < 2 {
-				ttl = 2
-			}
 			return ttl, nil
 		}
 		if responded {
 			lastRespondingHop = ttl
+			// Once the recommendation saturates, further probes cannot change
+			// the result; stop early to keep the probe short.
+			if recommendFakeTTL(ttl+1) >= maxFakeTTL {
+				return ttl + 1, nil
+			}
 		}
 	}
 

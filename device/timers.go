@@ -106,16 +106,10 @@ func expiredRetransmitHandshake(peer *Peer) {
 		 * handshake. Rotate the local port on retries when the port is dynamic;
 		 * the Android protect hook protects the new socket automatically. */
 		if attempt >= 2 {
-			autoPort := false
-			if binder, ok := peer.device.Bind().(interface{ IsAutoPort() bool }); ok {
-				autoPort = binder.IsAutoPort()
-			}
-			if autoPort {
-				if err := peer.device.BindUpdate(); err != nil {
-					peer.device.log.Errorf("%s - Unable to rotate UDP port: %v", peer, err)
-				} else {
-					peer.device.log.Verbosef("%s - Rotated local UDP port after failed handshake", peer)
-				}
+			if rotated, rotateErr := peer.device.RotatePort(); rotateErr != nil {
+				peer.device.log.Errorf("%s - Unable to rotate UDP port: %v", peer, rotateErr)
+			} else if rotated {
+				peer.device.log.Verbosef("%s - Rotated local UDP port after failed handshake", peer)
 			}
 		}
 

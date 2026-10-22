@@ -102,11 +102,10 @@ int c_protect_socket(int fd)
 
     pthread_mutex_lock(&vpn_mutex);
     JavaVM *vm = global_vm;
-    jobject service = global_vpn_service;
     jmethodID mid = global_protect_mid;
     pthread_mutex_unlock(&vpn_mutex);
 
-    if (vm == NULL || service == NULL || mid == NULL)
+    if (vm == NULL || mid == NULL)
         return 0;
 
     JNIEnv *env = NULL;
@@ -120,13 +119,31 @@ int c_protect_socket(int fd)
         return -1;
     }
 
-    jboolean result = (*env)->CallBooleanMethod(env, service, mid, (jint)fd);
+    /*
+     * c_set_vpn_service may replace (and delete) the global reference on any
+     * thread at any time. Holding a raw jobject across the call would be a
+     * use-after-free, so promote it to a thread-local reference while the mutex
+     * is held; the referenced object then stays alive for the duration of the
+     * protect() call even if the global reference is dropped meanwhile.
+     */
+    pthread_mutex_lock(&vpn_mutex);
+    jobject service = global_vpn_service ? (*env)->NewLocalRef(env, global_vpn_service) : NULL;
+    mid = global_protect_mid;
+    pthread_mutex_unlock(&vpn_mutex);
+
     int ret = 0;
-    if ((*env)->ExceptionCheck(env)) {
-        (*env)->ExceptionClear(env);
-        ret = -1;
-    } else if (result != JNI_TRUE) {
-        ret = -1;
+    if (service == NULL || mid == NULL) {
+        /* No VpnService registered: there is no routing loop to protect from. */
+        ret = 0;
+    } else {
+        jboolean result = (*env)->CallBooleanMethod(env, service, mid, (jint)fd);
+        if ((*env)->ExceptionCheck(env)) {
+            (*env)->ExceptionClear(env);
+            ret = -1;
+        } else if (result != JNI_TRUE) {
+            ret = -1;
+        }
+        (*env)->DeleteLocalRef(env, service);
     }
 
     if (detach)
@@ -143,8 +160,17 @@ static jint do_wgTurnOn(JNIEnv *env, jstring ifname, jint tun_fd, jstring settin
         return -1;
 
     const char *ifname_str = (*env)->GetStringUTFChars(env, ifname, 0);
+    if (ifname_str == NULL) {
+        (*env)->ExceptionClear(env);
+        return -1;
+    }
     size_t ifname_len = (*env)->GetStringUTFLength(env, ifname);
     const char *settings_str = (*env)->GetStringUTFChars(env, settings, 0);
+    if (settings_str == NULL) {
+        (*env)->ExceptionClear(env);
+        (*env)->ReleaseStringUTFChars(env, ifname, ifname_str);
+        return -1;
+    }
     size_t settings_len = (*env)->GetStringUTFLength(env, settings);
 
     int ret = wgTurnOn((struct go_string){
@@ -206,10 +232,24 @@ static jint do_wgStartSocks5(JNIEnv *env, jstring listen_addr, jstring settings)
     if (!settings)
         return -1;
 
-    const char *addr_str = listen_addr ? (*env)->GetStringUTFChars(env, listen_addr, 0) : "";
-    size_t addr_len = listen_addr ? (*env)->GetStringUTFLength(env, listen_addr) : 0;
-    const char *settings_str = settings ? (*env)->GetStringUTFChars(env, settings, 0) : "";
-    size_t settings_len = settings ? (*env)->GetStringUTFLength(env, settings) : 0;
+    const char *addr_str = "";
+    size_t addr_len = 0;
+    if (listen_addr) {
+        addr_str = (*env)->GetStringUTFChars(env, listen_addr, 0);
+        if (addr_str == NULL) {
+            (*env)->ExceptionClear(env);
+            return -1;
+        }
+        addr_len = (*env)->GetStringUTFLength(env, listen_addr);
+    }
+    const char *settings_str = (*env)->GetStringUTFChars(env, settings, 0);
+    if (settings_str == NULL) {
+        (*env)->ExceptionClear(env);
+        if (listen_addr)
+            (*env)->ReleaseStringUTFChars(env, listen_addr, addr_str);
+        return -1;
+    }
+    size_t settings_len = (*env)->GetStringUTFLength(env, settings);
 
     int ret = wgStartSocks5((struct go_string){
         .str = addr_str,

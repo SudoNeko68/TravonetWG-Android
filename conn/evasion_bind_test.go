@@ -270,7 +270,8 @@ func TestMimicDNSQuery(t *testing.T) {
 	}
 }
 
-// mockOpenBind simulates a bind that picks an ephemeral port when 0 is// requested and keeps an explicitly requested port otherwise.
+// mockOpenBind simulates a bind that picks an ephemeral port when 0 is
+// requested and keeps an explicitly requested port otherwise.
 type mockOpenBind struct {
 	Bind
 	ephemeralPort uint16
@@ -321,5 +322,93 @@ func TestIsAutoPort(t *testing.T) {
 	}
 	if !b.IsAutoPort() {
 		t.Fatal("expected dynamic port after returning to Open(0)")
+	}
+}
+
+// TestFakeTTLLiveUpdate verifies that decoy steps compiled with TTL 0 resolve
+// the bind's current FakeTTL at send time. This is what allows the background
+// Android AutoTTL probe to refine an already running tunnel instead of blocking
+// tunnel setup.
+func TestFakeTTLLiveUpdate(t *testing.T) {
+	mock := &mockUserspaceBind{}
+	cfg := DefaultEvasionConfig()
+	cfg.FakeTTL = 5
+	cfg.NormalTTL = 64
+	cfg.PreJunkSize = 0
+	cfg.Strategy = "fake_udp(148)"
+	cfg.Debug = false
+
+	b := NewEvasionBind(mock, cfg)
+	if got := b.FakeTTL(); got != 5 {
+		t.Fatalf("initial FakeTTL = %d; want 5", got)
+	}
+
+	ep := &StdNetEndpoint{}
+	handshake := make([]byte, WGHandshakeInitiationSize)
+	handshake[0] = 0x01
+
+	if err := b.sendUserspaceObfuscatedHandshake(ep, handshake); err != nil {
+		t.Fatalf("first handshake failed: %v", err)
+	}
+	if len(mock.ttlHistory) == 0 || mock.ttlHistory[0] != 5 {
+		t.Fatalf("expected decoy TTL 5, got %+v", mock.ttlHistory)
+	}
+
+	b.SetFakeTTL(7)
+	mock.ttlHistory = nil
+	if err := b.sendUserspaceObfuscatedHandshake(ep, handshake); err != nil {
+		t.Fatalf("second handshake failed: %v", err)
+	}
+	if len(mock.ttlHistory) == 0 || mock.ttlHistory[0] != 7 {
+		t.Fatalf("expected decoy TTL 7 after SetFakeTTL, got %+v", mock.ttlHistory)
+	}
+	if mock.ttlHistory[len(mock.ttlHistory)-1] != 64 {
+		t.Fatalf("expected TTL to be restored to NormalTTL, got %+v", mock.ttlHistory)
+	}
+}
+
+// TestSendUDPJumboKeepsPMTUState is a regression test for the jumbo decoy path:
+// IP_MTU_DISCOVER must not be left disabled on the shared socket, otherwise
+// later WireGuard transport packets would lose path-MTU discovery.
+func TestSendUDPJumboKeepsPMTUState(t *testing.T) {
+	listener, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatalf("failed to open UDP listener: %v", err)
+	}
+	defer listener.Close()
+	port := listener.LocalAddr().(*net.UDPAddr).Port
+
+	fd, err := unix.Socket(unix.AF_INET, unix.SOCK_DGRAM|unix.SOCK_CLOEXEC, unix.IPPROTO_UDP)
+	if err != nil {
+		t.Fatalf("failed to open UDP socket: %v", err)
+	}
+	defer unix.Close(fd)
+
+	before, err := unix.GetsockoptInt(fd, unix.IPPROTO_IP, unix.IP_MTU_DISCOVER)
+	if err != nil {
+		t.Fatalf("GetsockoptInt(IP_MTU_DISCOVER) failed: %v", err)
+	}
+
+	payload := make([]byte, 1600)
+	if err := sendUDPJumbo(fd, [4]byte{127, 0, 0, 1}, port, payload, 3); err != nil {
+		t.Fatalf("sendUDPJumbo failed: %v", err)
+	}
+
+	after, err := unix.GetsockoptInt(fd, unix.IPPROTO_IP, unix.IP_MTU_DISCOVER)
+	if err != nil {
+		t.Fatalf("GetsockoptInt(IP_MTU_DISCOVER) after send failed: %v", err)
+	}
+	if after != before {
+		t.Fatalf("IP_MTU_DISCOVER leaked: before=%d after=%d", before, after)
+	}
+
+	buf := make([]byte, 2048)
+	_ = listener.SetReadDeadline(time.Now().Add(time.Second))
+	n, _, err := listener.ReadFromUDP(buf)
+	if err != nil {
+		t.Fatalf("listener read failed: %v", err)
+	}
+	if n != len(payload) {
+		t.Fatalf("received %d bytes; want %d", n, len(payload))
 	}
 }

@@ -7,6 +7,7 @@ package conf
 
 import (
 	"bufio"
+	"context"
 	"encoding/base64"
 	"encoding/hex"
 	"fmt"
@@ -15,6 +16,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 )
 
 type PeerConfig struct {
@@ -40,6 +42,11 @@ type Config struct {
 	PreJunkSize int
 	Socks5      string
 	SocksAuth   string
+	NoEvasion   bool
+	Debug       bool
+	// DebugSet records that the config contained an explicit Debug key, so a
+	// deliberate "Debug = false" can override the default verbose logging.
+	DebugSet bool
 
 	// [Peer] list
 	Peers []PeerConfig
@@ -163,6 +170,11 @@ func ParseConfig(r io.Reader) (*Config, error) {
 				cfg.Socks5 = val
 			case "socksauth", "socks_auth", "socks-auth":
 				cfg.SocksAuth = val
+			case "noevasion", "no_evasion", "disableevasion", "disable_evasion":
+				cfg.NoEvasion = parseBoolValue(val)
+			case "debug", "evasion_debug", "evasiondebug":
+				cfg.Debug = parseBoolValue(val)
+				cfg.DebugSet = true
 			}
 
 		case "peer":
@@ -205,11 +217,11 @@ func ParseConfig(r io.Reader) (*Config, error) {
 			if cfg.PersistentKeepalive > 0 {
 				peers[i].PersistentKeepalive = cfg.PersistentKeepalive
 			} else {
-				peers[i].PersistentKeepalive = 10
+				peers[i].PersistentKeepalive = DefaultKeepalive
 			}
 		}
-		if IsPort500Endpoint(peers[i].Endpoint) && peers[i].PersistentKeepalive > 10 {
-			peers[i].PersistentKeepalive = 5
+		if IsPort500Endpoint(peers[i].Endpoint) && peers[i].PersistentKeepalive > LowPortKeepaliveLimit {
+			peers[i].PersistentKeepalive = LowPortKeepalive
 		}
 	}
 	cfg.Peers = peers
@@ -220,10 +232,10 @@ func ParseConfig(r io.Reader) (*Config, error) {
 		cfg.PersistentKeepalive = peers[0].PersistentKeepalive
 	} else {
 		if cfg.PersistentKeepalive <= 0 {
-			cfg.PersistentKeepalive = 10
+			cfg.PersistentKeepalive = DefaultKeepalive
 		}
-		if IsPort500Endpoint(cfg.Endpoint) && cfg.PersistentKeepalive > 10 {
-			cfg.PersistentKeepalive = 5
+		if IsPort500Endpoint(cfg.Endpoint) && cfg.PersistentKeepalive > LowPortKeepaliveLimit {
+			cfg.PersistentKeepalive = LowPortKeepalive
 		}
 	}
 
@@ -240,6 +252,31 @@ func IsPort500Endpoint(endpoint string) bool {
 		return true
 	}
 	return strings.HasSuffix(endpoint, ":500")
+}
+
+// dnsLookupTimeout bounds hostname resolution so a black-holed DNS server can
+// never stall tunnel setup (Android has no root and no way to inject a resolver
+// into the Go runtime, so a bounded context is the only safe control).
+const dnsLookupTimeout = 3 * time.Second
+
+// LookupHostIPs resolves a hostname with a bounded timeout and returns every
+// address advertised for it.
+func LookupHostIPs(host string) ([]net.IP, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), dnsLookupTimeout)
+	defer cancel()
+
+	addrs, err := net.DefaultResolver.LookupNetIP(ctx, "ip", host)
+	if err != nil {
+		return nil, err
+	}
+	ips := make([]net.IP, 0, len(addrs))
+	for _, addr := range addrs {
+		ips = append(ips, net.IP(addr.AsSlice()))
+	}
+	if len(ips) == 0 {
+		return nil, fmt.Errorf("no addresses found for %s", host)
+	}
+	return ips, nil
 }
 
 // ResolveEndpointHostPort resolves the host part of an endpoint if it is a
@@ -261,7 +298,7 @@ func ResolveEndpointHostPort(endpoint string) string {
 		return endpoint
 	}
 
-	ips, err := net.LookupIP(host)
+	ips, err := LookupHostIPs(host)
 	if err != nil || len(ips) == 0 {
 		return endpoint
 	}

@@ -124,6 +124,15 @@ GoBackend.wgStopSocks5(socks);
 curl -x socks5h://127.0.0.1:1080 https://ifconfig.me
 ```
 
+SOCKS5-порт открывается **синхронно**: если порт занят, `wgStartSocks5` сразу
+возвращает `-1` (а не «успех» с фоновой ошибкой). Прослушивание не на loopback
+(`0.0.0.0`, адрес Wi-Fi) без пароля запрещено — иначе телефон превращается в
+открытый прокси. Задайте `SocksAuth = user:pass` в `[Interface]`. Прокси
+поддерживает только TCP `CONNECT` (без `UDP ASSOCIATE`/`BIND`).
+
+`wgTurnOn`, `wgTurnOnProtected` и `wgStartSocks5` следует вызывать из фонового
+потока: при доменном `Endpoint` имя разрешается синхронно (таймаут 3 с).
+
 ---
 
 ## Конфигурация
@@ -142,6 +151,8 @@ Strategy = default-userspace
 FakeTTL = auto
 NormalTTL = 64
 PreJunk = 64
+# Debug = false          # отключить подробный logcat
+# NoEvasion = true       # полностью выключить desync-движок
 
 [Peer]
 PublicKey = ...
@@ -159,11 +170,22 @@ PersistentKeepalive = 25
 | Параметр | Описание |
 | :--- | :--- |
 | `Strategy` | userspace-DSL или алиас (`default`, `default-userspace`, `fake`) |
-| `FakeTTL` | TTL фейковых пакетов; `auto` включает kernel-зондирование |
+| `FakeTTL` | TTL фейковых пакетов; `auto` — зондирование хопов **в фоне** (см. ниже) |
 | `NormalTTL` | TTL легитимного рукопожатия и транспортных пакетов |
 | `PreJunk` / `jmin` | размер случайного UDP-пакета перед рукопожатием |
+| `NoEvasion` / `disable_evasion` | `true` — отключить desync целиком (обычный UDP) |
+| `Debug` / `evasion_debug` | `true`/`false` — подробные логи evasion и SOCKS5 в logcat |
 | `MTU` | MTU TUN-интерфейса (по умолчанию 1280, применяется через `Device.SetMTU`) |
-| `PersistentKeepalive` | keepalive; для endpoint'ов на порту 500 автоматически не более 5 с |
+| `PersistentKeepalive` | keepalive; по умолчанию 10 с, для endpoint'ов на порту 500 — не более 5 с |
+
+`FakeTTL = auto` больше не задерживает установку туннеля: зондирование TTL
+выполняется горутиной после `dev.Up()`, а фейковые пакеты до его завершения
+используют безопасное значение 5. Результат применяется на лету — стратегия
+подставляет актуальный `FakeTTL` в момент отправки, перезапуск не нужен.
+
+`PersistentKeepalive` в UAPI — это ключ уровня пира. Значение сохраняется в
+секции своего пира и никогда не «поднимается» в общий хвост конфигурации, так
+что в конфигурациях с несколькими пирами keepalive каждого из них не теряется.
 
 ---
 
@@ -179,6 +201,9 @@ PersistentKeepalive = 25
 | `jumbo_fake(size=1600)` | крупный UDP-пакет, фрагментируемый ядром | `jumbo_fake(1600)` |
 | `ipopt_shift(size, mode=nop\|ts\|rr)` | IPv4 options для легитимного handshake | `ipopt_shift(8, mode=ts)` |
 | `sleep(10ms)` | пауза между шагами | `sleep(5ms)` |
+
+Если `ttl=` не указан, TTL выбирается в момент отправки: `NormalTTL` для
+`junk`/`mimic` и текущий `FakeTTL` для `fake_udp`/`jumbo_fake`.
 
 Встроенная стратегия:
 
@@ -199,6 +224,14 @@ mimic(dns) -> junk(96) -> fake_udp(148, ttl=4) -> sleep(3ms)
 
 - Десинхронизация DPI применяется к IPv4-endpoint'ам; IPv6 идёт стандартным путём.
 - `jumbo_fake` использует фрагментацию IPv4 силами ядра, а не raw-сокеты.
+  `IP_MTU_DISCOVER=DONT` передаётся cmsg-сообщением в том же `sendmsg`, поэтому
+  настройка не «протекает» в обычные транспортные пакеты (на старых ядрах —
+  временный `setsockopt` с немедленным восстановлением).
+- После двух неудачных рукопожатий локальный UDP-порт меняется (только если
+  `ListenPort` не задан явно): это обходит блокировку 4-tuple. Новый сокет
+  защищается тем же `protect`-хуком.
+- Sticky sockets на Android намеренно отключены: rtnetlink-подписка на смену
+  адресов требует `CAP_NET_ADMIN`, которого нет у обычного приложения.
 - На некоторых прошивках SELinux запрещает `TUNGETIFF`/`SIOCGIFMTU`; библиотека
   использует безопасные значения по умолчанию (имя `tun0`, MTU 1280).
 - Одна универсальная стратегия невозможна: параметры зависят от оператора и
@@ -213,6 +246,12 @@ go test ./conf ./conn ./proxy
 GOOS=android GOARCH=arm64 CGO_ENABLED=1 \
   CC=$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android21-clang \
   go vet ./android
+```
+
+Полная сборка всех ABI (Linux и macOS, автоматический выбор самого нового NDK):
+
+```bash
+./build-android.sh
 ```
 
 Проверить JNI-символы:

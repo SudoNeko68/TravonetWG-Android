@@ -54,10 +54,19 @@ type EvasionBind struct {
 	Bind
 	cfg        EvasionConfig
 	mu         sync.RWMutex
-	ttlMu      sync.Mutex
 	actualPort uint16
 	autoPort   bool // last Open() used a kernel-assigned (dynamic) port
-	closed     bool
+
+	// sendMu serializes all sends on the underlying socket. IP_OPTIONS has to
+	// be applied with setsockopt (it is not portable as a cmsg), so two
+	// concurrent sends could otherwise leak a decoy's options into a transport
+	// packet. It also guarantees that the decoy pipeline is emitted in order.
+	sendMu sync.Mutex
+
+	// fakeTTL is the live TTL used for decoy packets. It starts at the
+	// configured value and can be updated at runtime once the Android AutoTTL
+	// probe (which runs in the background) has a result.
+	fakeTTL atomic.Int32
 
 	// Legacy (non-VpnService-aware) clients call vpnService.protect(fd) only
 	// after wgTurnOn returns. This gate delays the first send slightly so the
@@ -169,6 +178,34 @@ func (b *EvasionBind) IsAutoPort() bool {
 	return b.autoPort
 }
 
+// SetFakeTTL updates the TTL used by decoy packets. It is safe to call while
+// the device is running: the value is read for every handshake, so a
+// background AutoTTL probe can refine it without restarting the tunnel.
+func (b *EvasionBind) SetFakeTTL(ttl int) {
+	if ttl <= 0 {
+		ttl = defaultFakeTTLForPlatform()
+	}
+	b.fakeTTL.Store(int32(ttl))
+}
+
+// FakeTTL returns the TTL currently used for decoy packets.
+func (b *EvasionBind) FakeTTL() int {
+	return int(b.fakeTTL.Load())
+}
+
+// resolveFakeTTL returns the TTL to use for a decoy step. A step TTL of 0 means
+// "use the live FakeTTL", which lets the AutoTTL probe take effect without
+// recompiling the strategy.
+func (b *EvasionBind) resolveFakeTTL(stepTTL int) int {
+	if stepTTL > 0 {
+		return stepTTL
+	}
+	if ttl := b.FakeTTL(); ttl > 0 {
+		return ttl
+	}
+	return defaultFakeTTLForPlatform()
+}
+
 // NewEvasionBind wraps any Bind with the userspace DPI desync engine.
 func NewEvasionBind(base Bind, cfg EvasionConfig) *EvasionBind {
 	fakeTTL := cfg.FakeTTL
@@ -182,12 +219,12 @@ func NewEvasionBind(base Bind, cfg EvasionConfig) *EvasionBind {
 		cfg.PreJunkSize = 0
 	}
 
-	strat, err := ParseStrategy(cfg.Strategy, fakeTTL, cfg.NormalTTL)
+	strat, err := ParseStrategy(cfg.Strategy)
 	if err != nil {
 		if cfg.Debug {
 			log.Printf("[TRAVONET-WG] Invalid strategy '%s': %v (falling back to default-userspace)", cfg.Strategy, err)
 		}
-		strat = DefaultUserspaceStrategy(fakeTTL, cfg.NormalTTL)
+		strat = DefaultUserspaceStrategy()
 	}
 
 	b := &EvasionBind{
@@ -196,6 +233,7 @@ func NewEvasionBind(base Bind, cfg EvasionConfig) *EvasionBind {
 	}
 	b.cfg.compiledStrategy = strat
 	b.cfg.FakeTTL = fakeTTL
+	b.fakeTTL.Store(int32(fakeTTL))
 
 	if cfg.Debug {
 		b.logf("DEBUG: (evasion) [TRAVONET-WG] Active userspace evasion strategy: %s\n", strat.String())
@@ -222,7 +260,6 @@ func (b *EvasionBind) Open(port uint16) ([]ReceiveFunc, uint16, error) {
 		b.autoPort = false
 	}
 	b.actualPort = actualPort
-	b.closed = false
 	b.mu.Unlock()
 
 	if b.cfg.Debug {
@@ -264,13 +301,16 @@ func (b *EvasionBind) wrapReceiveFunc(fn ReceiveFunc) ReceiveFunc {
 }
 
 func (b *EvasionBind) Close() error {
-	b.mu.Lock()
-	b.closed = true
-	b.mu.Unlock()
 	return b.Bind.Close()
 }
 
 func (b *EvasionBind) Send(bufs [][]byte, ep Endpoint) error {
+	// Serialize sends on this socket: IP_OPTIONS and the jumbo fallback mutate
+	// per-socket state, and decoy packets must never be reordered after the
+	// legitimate handshake they are meant to precede.
+	b.sendMu.Lock()
+	defer b.sendMu.Unlock()
+
 	// Legacy embedders can only protect the socket after wgTurnOn returns.
 	b.waitIfLegacyProtectPending()
 
@@ -399,13 +439,7 @@ func (b *EvasionBind) sendUserspaceObfuscatedHandshake(ep Endpoint, wgPayload []
 
 		case ActionJumboFake:
 			jumboPayload := buildJumboFakePayload(step.Length)
-			ttl := step.TTL
-			if ttl <= 0 {
-				ttl = b.cfg.FakeTTL
-			}
-			if ttl <= 0 {
-				ttl = defaultFakeTTLForPlatform()
-			}
+			ttl := b.resolveFakeTTL(step.TTL)
 			if err := b.sendUserspacePacket(ep, fd, dstIP, dstPort, jumboPayload, ttl, ""); err != nil {
 				if b.cfg.Debug {
 					b.logf("DEBUG: (evasion) [TRAVONET-WG]   [%d/%d] jumbo_fake send error: %v\n", i+1, len(strategy.Steps), err)
@@ -417,13 +451,7 @@ func (b *EvasionBind) sendUserspaceObfuscatedHandshake(ep Endpoint, wgPayload []
 
 		case ActionFakeUDP:
 			fakePayload := buildFakeHandshakePayload(step.Length, step.CorruptHeader)
-			ttl := step.TTL
-			if ttl <= 0 {
-				ttl = b.cfg.FakeTTL
-			}
-			if ttl <= 0 {
-				ttl = defaultFakeTTLForPlatform()
-			}
+			ttl := b.resolveFakeTTL(step.TTL)
 			ipMode := step.IPOptMode
 			if err := b.sendUserspacePacket(ep, fd, dstIP, dstPort, fakePayload, ttl, ipMode); err != nil {
 				if b.cfg.Debug {
@@ -485,7 +513,7 @@ func (b *EvasionBind) sendUserspaceObfuscatedHandshake(ep Endpoint, wgPayload []
 func (b *EvasionBind) userspaceStrategy() *Strategy {
 	strat := b.cfg.compiledStrategy
 	if strat == nil || len(strat.Steps) == 0 {
-		return DefaultUserspaceStrategy(b.cfg.FakeTTL, b.cfg.NormalTTL)
+		return DefaultUserspaceStrategy()
 	}
 	return strat
 }
@@ -522,7 +550,7 @@ func (b *EvasionBind) sendUserspacePacket(ep Endpoint, fd int, dstIP [4]byte, ds
 
 	if fd >= 0 {
 		var err error
-		if payloadIsJumbo(payload) && len(payload) > 1500 {
+		if payloadIsJumbo(payload) {
 			err = sendUDPJumbo(fd, dstIP, dstPort, payload, ttl)
 		} else {
 			var opts []byte
@@ -539,8 +567,6 @@ func (b *EvasionBind) sendUserspacePacket(ep Endpoint, fd int, dstIP [4]byte, ds
 		}
 	}
 
-	b.ttlMu.Lock()
-	defer b.ttlMu.Unlock()
 	if ttl != b.cfg.NormalTTL {
 		_ = b.SetIPv4TTL(ttl)
 	}
@@ -551,9 +577,15 @@ func (b *EvasionBind) sendUserspacePacket(ep Endpoint, fd int, dstIP [4]byte, ds
 	return err
 }
 
+// jumboFragmentationThreshold is the payload size above which the kernel is
+// asked to fragment the decoy datagram. Anything above a typical path MTU would
+// otherwise fail with EMSGSIZE while PMTU discovery is active.
+const jumboFragmentationThreshold = 1200
+
 // payloadIsJumbo reports whether payload should use the oversized-datagram
 // send path (kernel-side IPv4 fragmentation). Only jumbo_fake generates such
-// payloads.
+// payloads, and the threshold is deliberately lower than the smallest
+// jumbo_fake size so an explicitly configured smaller payload still works.
 func payloadIsJumbo(payload []byte) bool {
-	return len(payload) > 1200
+	return len(payload) > jumboFragmentationThreshold
 }

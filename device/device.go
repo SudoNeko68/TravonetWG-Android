@@ -468,10 +468,48 @@ func (device *Device) BindSetMark(mark uint32) error {
 	return nil
 }
 
+// BindUpdate closes and reopens the bind, keeping the current UDP port.
 func (device *Device) BindUpdate() error {
 	device.net.Lock()
 	defer device.net.Unlock()
 
+	return device.bindUpdateLocked()
+}
+
+// RotatePort closes and reopens the bind on a new kernel-assigned UDP port.
+//
+// It only acts when the bind is using an ephemeral port (listen_port = 0). An
+// explicit listen_port is never changed behind the application's back, because
+// that would break inbound NAT mappings the user relies on. The new socket is
+// protected by the same control function as the old one, so this works inside
+// an Android VpnService without any additional privileges.
+//
+// It returns rotated=false (and a nil error) when no rotation was performed.
+func (device *Device) RotatePort() (rotated bool, err error) {
+	device.net.Lock()
+	defer device.net.Unlock()
+
+	if !device.isUp() || device.net.bind == nil {
+		return false, nil
+	}
+	binder, ok := device.net.bind.(interface{ IsAutoPort() bool })
+	if !ok || !binder.IsAutoPort() {
+		return false, nil
+	}
+
+	// Asking the kernel for port 0 is what actually guarantees a different
+	// 4-tuple: the previous port must not be requested again, otherwise the
+	// kernel hands back the very same mapping and rotation is a no-op.
+	device.net.port = 0
+	if err := device.bindUpdateLocked(); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// bindUpdateLocked closes and reopens the bind. The caller must hold
+// device.net.
+func (device *Device) bindUpdateLocked() error {
 	// close existing sockets
 	if err := closeBindLocked(device); err != nil {
 		return err
