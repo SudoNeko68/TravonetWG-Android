@@ -27,16 +27,6 @@ const (
 	LowPortKeepaliveLimit = 10
 )
 
-// amneziaWGKeys are UAPI keys produced by AmneziaWG configs that the vanilla
-// WireGuard UAPI parser rejects. They are dropped before device.IpcSet sees
-// them.
-var amneziaWGKeys = map[string]bool{
-	"jc": true, "jmax": true,
-	"s1": true, "s2": true, "s3": true, "s4": true,
-	"h1": true, "h2": true, "h3": true, "h4": true,
-	"i1": true, "i2": true, "i3": true, "i4": true, "i5": true,
-}
-
 // UAPIEvasion carries the TravonetWG-specific knobs extracted from a UAPI blob.
 // The Has* fields distinguish "not specified" (keep the caller's default) from
 // an explicit zero value.
@@ -128,10 +118,6 @@ func FilterUAPI(settings string) (cleanUAPI string, ev UAPIEvasion) {
 		key = strings.ToLower(strings.TrimSpace(key))
 		val = strings.TrimSpace(val)
 
-		if amneziaWGKeys[key] {
-			continue
-		}
-
 		switch key {
 		case "strategy":
 			ev.Strategy, ev.HasStrategy = val, true
@@ -165,6 +151,7 @@ func FilterUAPI(settings string) (cleanUAPI string, ev UAPIEvasion) {
 			if v, convErr := strconv.Atoi(val); convErr == nil && !explicitPre {
 				ev.PreJunkSize, ev.HasPreJunkSize = v, true
 			}
+			out = append(out, line)
 			continue
 
 		case "noevasion", "no_evasion", "disableevasion", "disable_evasion":

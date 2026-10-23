@@ -161,9 +161,10 @@ AllowedIPs = 0.0.0.0/0
 PersistentKeepalive = 25
 ```
 
-Также поддерживается UAPI-формат. AmneziaWG-ключи (`jc`, `jmax`, `s1`–`s4`,
-`h1`–`h4`, `i1`–`i5`) отбрасываются, а `jmin` при отсутствии `PreJunk`
-используется как размер pre-junk.
+Также поддерживается UAPI-формат. Параметры AmneziaWG (`jc`, `jmin`, `jmax`,
+`s1`–`s4`, `h1`–`h4`, `i1`–`i5`, `header_protection_key`, `content_padding_addition`,
+`random_trailers`, `disable_cookies`, тайминги) передаются в устройство и реализуются на уровне
+wire-формата (см. раздел «AmneziaWG»).
 
 ### Параметры
 
@@ -173,6 +174,9 @@ PersistentKeepalive = 25
 | `FakeTTL` | TTL фейковых пакетов; `auto` — зондирование хопов **в фоне** (см. ниже) |
 | `NormalTTL` | TTL легитимного рукопожатия и транспортных пакетов |
 | `PreJunk` / `jmin` | размер случайного UDP-пакета перед рукопожатием |
+| `Jc` / `Jmin` / `Jmax` | количество и размеры junk-пакетов AmneziaWG |
+| `S1`–`S4` | случайный префикс handshake/transport-пакетов |
+| `H1`–`H4` | значения (или диапазоны `a-b`) полей типа сообщений |
 | `NoEvasion` / `disable_evasion` | `true` — отключить desync целиком (обычный UDP) |
 | `Debug` / `evasion_debug` | `true`/`false` — подробные логи evasion и SOCKS5 в logcat |
 | `MTU` | MTU TUN-интерфейса (по умолчанию 1280, применяется через `Device.SetMTU`) |
@@ -186,6 +190,80 @@ PersistentKeepalive = 25
 `PersistentKeepalive` в UAPI — это ключ уровня пира. Значение сохраняется в
 секции своего пира и никогда не «поднимается» в общий хвост конфигурации, так
 что в конфигурациях с несколькими пирами keepalive каждого из них не теряется.
+
+---
+
+## AmneziaWG
+
+Клиент полностью совместим с AmneziaWG-серверами (AWG 1.5, 2.0 и AWG 3+):
+достаточно вставить параметры обфускации из выданного конфига в секцию `[Interface]`.
+
+```ini
+[Interface]
+PrivateKey = ...
+Address = 10.8.1.2/32
+DNS = 1.1.1.1
+MTU = 1280
+
+# AmneziaWG wire-format obfuscation
+Jc = 4
+Jmin = 50
+Jmax = 1000
+S1 = 30
+S2 = 20
+S3 = 10
+S4 = 15
+H1 = 1234567890
+H2 = 1987654321
+H3 = 1357924680
+H4 = 2468013579
+I1 = <b 0xdeadbeef><r 16>
+I2 = <rc 12>
+
+# AmneziaWG extended features (AWG 3+)
+HeaderProtectionKey = 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+ContentPaddingAddition = 8-16
+RandomTrailers = true
+DisableCookies = false
+RekeyAfterTime = 120
+RekeyTimeout = 5
+RejectAfterTime = 180
+KeepaliveTimeout = 10
+MaxHandshakeAttempts = 10
+
+[Peer]
+PublicKey = ...
+Endpoint = 1.2.3.4:51820
+AllowedIPs = 0.0.0.0/0
+PersistentKeepalive = 25
+```
+
+Что реализовано:
+
+- **Junk-пакеты** — `Jc` случайных датаграмм размером `Jmin`–`Jmax`
+  отправляются перед каждым рукопожатием.
+- **Message padding** — `S1`/`S2`/`S3`/`S4` случайных байт добавляются перед
+  initiation/response/cookie/transport сообщениями; входящие пакеты
+  распознаются и обрезаются автоматически.
+- **Magic headers** — `H1`–`H4` заменяют стандартные типы сообщений WireGuard.
+  Поддерживаются как одиночные значения, так и диапазоны (`123-456`), из
+  которых выбирается случайное значение для каждого пакета.
+- **Signature packets** — `I1`–`I5` поддерживают теги `<b 0x…>`, `<r N>`,
+  `<rc N>`, `<rd N>`, `<t>` и отправляются перед рукопожатием.
+- **Header Protection Key** — 256-битный ключ (`HeaderProtectionKey`, hex или base64)
+  для шифрования заголовков и типов пакетов алгоритмом ChaCha20, предотвращающий
+  сигнатурный анализ DPI даже при известных magic headers.
+- **Content Padding & Random Trailers** — динамическое добавление случайного
+  паддинга (`ContentPaddingAddition`, напр. `8-16`) и трейлеров (`RandomTrailers`)
+  к транспортным пакетам и хэндшейкам.
+- **Кастомные тайминги** — управление поведением повторных рукопожатий и keepalive
+  (`RekeyAfterTime`, `RekeyTimeout`, `RejectAfterTime`, `KeepaliveTimeout`, `MaxHandshakeAttempts`).
+- Параметры не заданы → устройство работает как обычный WireGuard-клиент;
+  оба режима могут использоваться одновременно разными устройствами.
+
+UAPI-ключи `jc`, `jmin`, `jmax`, `s1`–`s4`, `h1`–`h4`, `i1`–`i5`, `header_protection_key`,
+`content_padding_addition`, `random_trailers`, `disable_cookies`, а также тайминги
+принимаются как при разборе `.conf`, так и при прямой передаче UAPI-конфигурации.
 
 ---
 

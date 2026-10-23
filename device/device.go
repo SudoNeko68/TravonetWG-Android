@@ -89,6 +89,45 @@ type Device struct {
 	ipcMutex sync.RWMutex
 	closed   chan struct{}
 	log      *Logger
+
+	// AmneziaWG wire-format obfuscation (see amnezia.go).
+	amnezia struct {
+		junk struct {
+			count atomic.Uint32
+			min   atomic.Uint32
+			max   atomic.Uint32
+		}
+		paddings struct {
+			init      atomic.Uint32
+			response  atomic.Uint32
+			cookie    atomic.Uint32
+			transport atomic.Uint32
+		}
+		headers struct {
+			init      AtomicUintRange
+			response  AtomicUintRange
+			cookie    AtomicUintRange
+			transport AtomicUintRange
+		}
+		signatures [5]atomic.Pointer[signaturePacket]
+
+		headerProtection struct {
+			sync.RWMutex
+			key HeaderCipherKey
+		}
+
+		contentPaddingAddition AtomicUintRange
+		randomTrailers         atomic.Bool
+		disableCookies         atomic.Bool
+
+		timings struct {
+			rekeyAfterTimeSec   AtomicUintRange
+			rekeyTimeoutSec     AtomicUintRange
+			rejectAfterTimeSec  AtomicUintRange
+			keepaliveTimeoutSec AtomicUintRange
+			maxHandshakeAttemps AtomicUintRange
+		}
+	}
 }
 
 // deviceState represents the state of a Device.
@@ -297,6 +336,7 @@ func NewDevice(tunDevice tun.Device, bind conn.Bind, logger *Logger) *Device {
 	device.peers.keyMap = make(map[NoisePublicKey]*Peer)
 	device.rate.limiter.Init()
 	device.indexTable.Init()
+	device.initAmnezia()
 
 	device.PopulatePools()
 

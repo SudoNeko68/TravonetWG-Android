@@ -73,7 +73,7 @@ persistent_keepalive_interval=25
 	}
 }
 
-func TestFilterUAPIStripsAmneziaAndCustomKeys(t *testing.T) {
+func TestFilterUAPIStripsEvasionKeysAndPreservesAmneziaWG(t *testing.T) {
 	const settings = `private_key=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 jc=5
 jmax=120
@@ -93,9 +93,17 @@ endpoint=1.2.3.4:2408
 
 	clean, ev := FilterUAPI(settings)
 
-	for _, leaked := range []string{"jc=", "jmax=", "s1=", "h1=", "i1=", "strategy=", "fake_ttl=", "normal_ttl=", "jmin=", "no_evasion=", "debug=", "mtu="} {
+	// Evasion-only keys must be stripped from UAPI stream
+	for _, leaked := range []string{"strategy=", "fake_ttl=", "normal_ttl=", "no_evasion=", "debug=", "mtu="} {
 		if strings.Contains(clean, leaked) {
-			t.Errorf("custom/AmneziaWG key %q leaked into the UAPI stream:\n%s", leaked, clean)
+			t.Errorf("evasion key %q leaked into the UAPI stream:\n%s", leaked, clean)
+		}
+	}
+
+	// AmneziaWG keys must be preserved for device.IpcSet
+	for _, expected := range []string{"jc=5", "jmax=120", "jmin=40", "s1=16", "h1=123456", "i1=<b 0xdeadbeef>"} {
+		if !strings.Contains(clean, expected) {
+			t.Errorf("AmneziaWG key %q was incorrectly stripped from UAPI stream:\n%s", expected, clean)
 		}
 	}
 

@@ -42,6 +42,7 @@ if [ -z "${ANDROID_NDK_HOME:-}" ] && [ -z "${ANDROID_NDK_ROOT:-}" ]; then
         "$HOME/Android/Sdk/ndk" \
         "$HOME/Library/Android/sdk/ndk" \
         "/opt/android-sdk/ndk" \
+        "/opt/android-ndk" \
         "${ANDROID_HOME:-}/ndk" \
         "${ANDROID_SDK_ROOT:-}/ndk"; do
         [ -d "$base" ] || continue

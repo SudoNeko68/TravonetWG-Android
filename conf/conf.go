@@ -48,6 +48,34 @@ type Config struct {
 	// deliberate "Debug = false" can override the default verbose logging.
 	DebugSet bool
 
+	// AmneziaWG obfuscation settings in [Interface]
+	Jc   int
+	Jmin int
+	Jmax int
+	S1   int
+	S2   int
+	S3   int
+	S4   int
+	H1   string
+	H2   string
+	H3   string
+	H4   string
+	I1   string
+	I2   string
+	I3   string
+	I4   string
+	I5   string
+
+	HeaderProtectionKey    string
+	ContentPaddingAddition string
+	RandomTrailers         bool
+	DisableCookies         bool
+	RekeyAfterTime         string
+	RekeyTimeout           string
+	RejectAfterTime        string
+	KeepaliveTimeout       string
+	MaxHandshakeAttempts   string
+
 	// [Peer] list
 	Peers []PeerConfig
 
@@ -156,12 +184,82 @@ func ParseConfig(r io.Reader) (*Config, error) {
 				if ttl, err := strconv.Atoi(val); err == nil && ttl > 0 {
 					cfg.NormalTTL = ttl
 				}
+			case "jc":
+				if v, err := strconv.Atoi(val); err == nil && v >= 0 {
+					cfg.Jc = v
+				}
 			case "jmin":
-				// AmneziaWG compatibility: jmin is the minimum junk packet size
-				// and maps naturally to TravonetWG's PreJunk.
+				if v, err := strconv.Atoi(val); err == nil && v >= 0 {
+					cfg.Jmin = v
+				}
 				if sz, err := strconv.Atoi(val); err == nil && cfg.PreJunkSize == 0 {
 					cfg.PreJunkSize = sz
 				}
+			case "jmax":
+				if v, err := strconv.Atoi(val); err == nil && v >= 0 {
+					cfg.Jmax = v
+				}
+			case "s1", "s2", "s3", "s4":
+				v, err := strconv.Atoi(val)
+				if err != nil || v < 0 {
+					break
+				}
+				switch key {
+				case "s1":
+					cfg.S1 = v
+				case "s2":
+					cfg.S2 = v
+				case "s3":
+					cfg.S3 = v
+				case "s4":
+					cfg.S4 = v
+				}
+			case "h1", "h2", "h3", "h4":
+				switch key {
+				case "h1":
+					cfg.H1 = val
+				case "h2":
+					cfg.H2 = val
+				case "h3":
+					cfg.H3 = val
+				case "h4":
+					cfg.H4 = val
+				}
+			case "i1", "i2", "i3", "i4", "i5":
+				switch key {
+				case "i1":
+					cfg.I1 = val
+				case "i2":
+					cfg.I2 = val
+				case "i3":
+					cfg.I3 = val
+				case "i4":
+					cfg.I4 = val
+				case "i5":
+					cfg.I5 = val
+				}
+			case "headerprotectionkey", "header_protection_key":
+				cfg.HeaderProtectionKey = val
+			case "contentpaddingaddition", "content_padding_addition":
+				cfg.ContentPaddingAddition = val
+			case "randomtrailers", "random_trailers":
+				if b, err := strconv.ParseBool(val); err == nil {
+					cfg.RandomTrailers = b
+				}
+			case "disablecookies", "disable_cookies":
+				if b, err := strconv.ParseBool(val); err == nil {
+					cfg.DisableCookies = b
+				}
+			case "rekeyaftertime", "rekey_after_time":
+				cfg.RekeyAfterTime = val
+			case "rekeytimeout", "rekey_timeout":
+				cfg.RekeyTimeout = val
+			case "rejectaftertime", "reject_after_time":
+				cfg.RejectAfterTime = val
+			case "keepalivetimeout", "keepalive_timeout":
+				cfg.KeepaliveTimeout = val
+			case "maxhandshakeattempts", "max_handshake_attempts":
+				cfg.MaxHandshakeAttempts = val
 			case "persistentkeepalive", "persistent_keepalive", "persistent-keepalive":
 				if pka, err := strconv.Atoi(val); err == nil && pka > 0 {
 					cfg.PersistentKeepalive = pka
@@ -329,6 +427,83 @@ func (c *Config) ToUAPI() (string, error) {
 
 	if c.ListenPort > 0 {
 		sb.WriteString(fmt.Sprintf("listen_port=%d\n", c.ListenPort))
+	}
+
+	// AmneziaWG obfuscation settings (device-level UAPI keys).
+	if c.Jc > 0 {
+		sb.WriteString(fmt.Sprintf("jc=%d\n", c.Jc))
+	}
+	if c.Jmin > 0 {
+		sb.WriteString(fmt.Sprintf("jmin=%d\n", c.Jmin))
+	}
+	if c.Jmax > 0 {
+		sb.WriteString(fmt.Sprintf("jmax=%d\n", c.Jmax))
+	}
+	if c.S1 > 0 {
+		sb.WriteString(fmt.Sprintf("s1=%d\n", c.S1))
+	}
+	if c.S2 > 0 {
+		sb.WriteString(fmt.Sprintf("s2=%d\n", c.S2))
+	}
+	if c.S3 > 0 {
+		sb.WriteString(fmt.Sprintf("s3=%d\n", c.S3))
+	}
+	if c.S4 > 0 {
+		sb.WriteString(fmt.Sprintf("s4=%d\n", c.S4))
+	}
+	if c.H1 != "" {
+		sb.WriteString(fmt.Sprintf("h1=%s\n", c.H1))
+	}
+	if c.H2 != "" {
+		sb.WriteString(fmt.Sprintf("h2=%s\n", c.H2))
+	}
+	if c.H3 != "" {
+		sb.WriteString(fmt.Sprintf("h3=%s\n", c.H3))
+	}
+	if c.H4 != "" {
+		sb.WriteString(fmt.Sprintf("h4=%s\n", c.H4))
+	}
+	if c.I1 != "" {
+		sb.WriteString(fmt.Sprintf("i1=%s\n", c.I1))
+	}
+	if c.I2 != "" {
+		sb.WriteString(fmt.Sprintf("i2=%s\n", c.I2))
+	}
+	if c.I3 != "" {
+		sb.WriteString(fmt.Sprintf("i3=%s\n", c.I3))
+	}
+	if c.I4 != "" {
+		sb.WriteString(fmt.Sprintf("i4=%s\n", c.I4))
+	}
+	if c.I5 != "" {
+		sb.WriteString(fmt.Sprintf("i5=%s\n", c.I5))
+	}
+	if c.HeaderProtectionKey != "" {
+		sb.WriteString(fmt.Sprintf("header_protection_key=%s\n", c.HeaderProtectionKey))
+	}
+	if c.ContentPaddingAddition != "" {
+		sb.WriteString(fmt.Sprintf("content_padding_addition=%s\n", c.ContentPaddingAddition))
+	}
+	if c.RandomTrailers {
+		sb.WriteString("random_trailers=true\n")
+	}
+	if c.DisableCookies {
+		sb.WriteString("disable_cookies=true\n")
+	}
+	if c.RekeyAfterTime != "" {
+		sb.WriteString(fmt.Sprintf("rekey_after_time=%s\n", c.RekeyAfterTime))
+	}
+	if c.RekeyTimeout != "" {
+		sb.WriteString(fmt.Sprintf("rekey_timeout=%s\n", c.RekeyTimeout))
+	}
+	if c.RejectAfterTime != "" {
+		sb.WriteString(fmt.Sprintf("reject_after_time=%s\n", c.RejectAfterTime))
+	}
+	if c.KeepaliveTimeout != "" {
+		sb.WriteString(fmt.Sprintf("keepalive_timeout=%s\n", c.KeepaliveTimeout))
+	}
+	if c.MaxHandshakeAttempts != "" {
+		sb.WriteString(fmt.Sprintf("max_handshake_attempts=%s\n", c.MaxHandshakeAttempts))
 	}
 
 	peers := c.Peers
