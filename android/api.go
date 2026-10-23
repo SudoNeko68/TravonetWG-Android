@@ -255,6 +255,14 @@ func wgTurnOn(interfaceName string, tunFd int32, settings string) int32 {
 		mtu = actualMTU
 	}
 
+	// On Android, cellular networks (LTE/5G) often have path MTUs of 1280-1380 bytes
+	// due to carrier GTP-U encapsulation. An MTU above 1280 causes silent packet
+	// drops (PMTU black hole) on mobile data. Enforce 1280 for mobile carrier safety.
+	if mtu > 1280 {
+		logger.Verbosef("Clamping MTU from %d to 1280 for mobile network compatibility", mtu)
+		mtu = 1280
+	}
+
 	logger.Verbosef("Attaching to interface %v (strategy=%s, fake_ttl=%d, mtu=%d, evasion=%v)",
 		name, evasionCfg.Strategy, evasionCfg.FakeTTL, mtu, evasionCfg.Enabled)
 
@@ -282,7 +290,9 @@ func wgTurnOn(interfaceName string, tunFd int32, settings string) int32 {
 		dev.Close()
 		return -1
 	}
-	dev.DisableSomeRoamingForBrokenMobileSemantics()
+	// Roaming must remain enabled on Android so that peers can dynamically update
+	// their endpoints when cellular radio handovers, NAT port-shifts, or Wi-Fi <->
+	// mobile data switches happen. Do NOT disable roaming.
 
 	if autoFakeTTL {
 		startAutoFakeTTLProbe(evasionBind, endpoint, logger)
@@ -469,6 +479,10 @@ func wgStartSocks5(listenAddr string, settings string) int32 {
 		return -1
 	}
 
+	if mtu > 1280 {
+		mtu = 1280
+	}
+
 	tunDev, tnet, err := netstack.CreateNetTUN(localIPs, dnsIPs, mtu)
 	if err != nil {
 		logger.Errorf("CreateNetTUN: %v", err)
@@ -490,7 +504,7 @@ func wgStartSocks5(listenAddr string, settings string) int32 {
 		dev.Close()
 		return -1
 	}
-	dev.DisableSomeRoamingForBrokenMobileSemantics()
+	// Keep roaming enabled for mobile networks.
 
 	if autoFakeTTL {
 		startAutoFakeTTLProbe(evasionBind, endpoint, logger)

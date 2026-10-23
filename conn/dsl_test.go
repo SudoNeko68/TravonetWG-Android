@@ -27,16 +27,31 @@ func TestParseDefaultStrategy(t *testing.T) {
 	if st.Steps[1].Action != ActionMimic || st.Steps[1].MimicProto != "stun" {
 		t.Errorf("step 1 mismatch: %+v", st.Steps[1])
 	}
-	// TTL 0 means "resolve at send time" so a runtime AutoTTL update takes
-	// effect without recompiling the strategy.
-	if st.Steps[2].Action != ActionJumboFake || st.Steps[2].Length != 1600 || st.Steps[2].TTL != 0 {
+	if st.Steps[2].Action != ActionJunk || st.Steps[2].Length != 64 {
 		t.Errorf("step 2 mismatch: %+v", st.Steps[2])
 	}
-	if st.Steps[3].Action != ActionFakeUDP || st.Steps[3].Length != 148 || st.Steps[3].TTL != 0 {
+	if st.Steps[3].Action != ActionFakeUDP || st.Steps[3].Length != 148 || !st.Steps[3].CorruptHeader || st.Steps[3].IPOptMode != "" {
 		t.Errorf("step 3 mismatch: %+v", st.Steps[3])
 	}
-	if st.Steps[4].Action != ActionSleep || st.Steps[4].SleepDur != 2*time.Millisecond {
+	if st.Steps[4].Action != ActionSleep || st.Steps[4].SleepDur != 15*time.Millisecond {
 		t.Errorf("step 4 mismatch: %+v", st.Steps[4])
+	}
+}
+
+func TestParseBroadbandStrategy(t *testing.T) {
+	st, err := ParseStrategy("broadband")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if len(st.Steps) != 5 {
+		t.Fatalf("expected 5 steps in broadband strategy, got %d", len(st.Steps))
+	}
+	if st.Steps[2].Action != ActionJumboFake || st.Steps[2].Length != 1600 {
+		t.Errorf("step 2 mismatch: %+v", st.Steps[2])
+	}
+	if st.Steps[3].Action != ActionFakeUDP || st.Steps[3].IPOptMode != "ts" {
+		t.Errorf("step 3 mismatch: %+v", st.Steps[3])
 	}
 }
 

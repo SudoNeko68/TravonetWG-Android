@@ -94,18 +94,53 @@ func formatTTL(ttl int) string {
 	return strconv.Itoa(ttl)
 }
 
-// DefaultUserspaceStrategy creates the unprivileged Android desync pipeline.
-// It relies only on a regular SOCK_DGRAM socket:
+// DefaultUserspaceStrategy creates the unprivileged, mobile-safe Android desync pipeline.
+// It relies only on standard unfragmented UDP datagrams without IP Options:
 //
-//	mimic(quic) -> mimic(stun) -> jumbo_fake(1600) -> fake_udp(148) -> sleep(2ms)
+//	mimic(quic) -> mimic(stun) -> junk(64) -> fake_udp(148, corrupt=true) -> sleep(15ms)
 //
 // The legitimate WireGuard handshake is appended by the caller.
 //
+// Key mobile-safe design choices:
+//   - No IP Options (ipopt): cellular carriers (LTE/5G PGW/UPF) drop packets with IP Options (IHL > 5).
+//   - No L3 fragmentation (jumbo_fake): cellular networks drop UDP fragments.
+//   - All packets fit within mobile MTU (<= 1200 bytes).
+//   - 15ms sleep allows cellular radio scheduling (PUCCH/PUSCH BSR) to serialize decoys before the real handshake.
+//
 // Steps are compiled with TTL 0, meaning "resolve at send time": mimic and junk
-// packets use NormalTTL, while fake_udp and jumbo_fake use the bind's live
-// FakeTTL. That is what allows the background AutoTTL probe to refine the TTL
-// of an already running tunnel.
+// packets use NormalTTL, while fake_udp uses the bind's live FakeTTL (defaulting to 7 on Android).
 func DefaultUserspaceStrategy() *Strategy {
+	return &Strategy{
+		Raw: "mimic(quic) -> mimic(stun) -> junk(size=64) -> fake_udp(size=148, corrupt=true) -> sleep(15ms)",
+		Steps: []Step{
+			{
+				Action:     ActionMimic,
+				MimicProto: "quic",
+			},
+			{
+				Action:     ActionMimic,
+				MimicProto: "stun",
+			},
+			{
+				Action: ActionJunk,
+				Length: 64,
+			},
+			{
+				Action:        ActionFakeUDP,
+				Length:        WGHandshakeInitiationSize,
+				CorruptHeader: true,
+			},
+			{
+				Action:   ActionSleep,
+				SleepDur: 15 * time.Millisecond,
+			},
+		},
+	}
+}
+
+// BroadbandUserspaceStrategy provides the legacy oversized decoy strategy
+// for wired broadband / Wi-Fi connections that do not drop IP Options or fragments.
+func BroadbandUserspaceStrategy() *Strategy {
 	return &Strategy{
 		Raw: "mimic(quic) -> mimic(stun) -> jumbo_fake(size=1600) -> fake_udp(size=148, ipopt=ts) -> sleep(2ms)",
 		Steps: []Step{
@@ -142,8 +177,10 @@ func DefaultUserspaceStrategy() *Strategy {
 func ParseStrategy(dsl string) (*Strategy, error) {
 	clean := strings.TrimSpace(dsl)
 	switch strings.ToLower(clean) {
-	case "", "default", "default-userspace", "userspace", "5packet", "early-term", "ipfrag2", "split2":
+	case "", "default", "default-userspace", "userspace", "mobile", "mobile-safe", "5packet", "early-term", "ipfrag2", "split2":
 		return DefaultUserspaceStrategy(), nil
+	case "broadband", "wifi", "wifi-jumbo", "jumbo":
+		return BroadbandUserspaceStrategy(), nil
 	case "fake,ipfrag2", "fake,split2", "fake", "fake_udp", "fake_packet":
 		// Old raw-fragmentation aliases degrade to the userspace fake packet.
 		clean = "fake_udp(148)"

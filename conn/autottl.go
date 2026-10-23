@@ -17,13 +17,15 @@ import (
 const (
 	// minFakeTTL .. maxFakeTTL is the DPI-safe window: the decoy must survive
 	// long enough to reach the domestic DPI but expire before the real server.
+	// On cellular networks (LTE/5G), hops to the carrier border TSPU are often 4-6,
+	// so maxFakeTTL is expanded to 8.
 	minFakeTTL = 3
-	maxFakeTTL = 7
+	maxFakeTTL = 8
 
 	// maxProbeTTL bounds the AutoTTL probe. Beyond this distance the
 	// recommendation is already saturated, and mobile networks frequently
 	// filter ICMP entirely, so probing further only wastes battery.
-	maxProbeTTL = 12
+	maxProbeTTL = 14
 
 	// autoTTLDNSTimeout bounds name resolution inside the probe.
 	autoTTLDNSTimeout = 3 * time.Second

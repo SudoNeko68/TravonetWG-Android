@@ -87,10 +87,12 @@ func (b *EvasionBind) logf(format string, args ...interface{}) {
 }
 
 // defaultFakeTTLForPlatform returns the safe fallback FakeTTL used on Android
-// when the network distance cannot be probed. It must stay below the distance
-// to the real server so the decoy never reaches it.
+// when the network distance cannot be probed. On cellular networks (LTE/5G),
+// the internal routing path through eNodeB -> SGW -> PGW -> Carrier Core to the
+// border TSPU is 4-6 hops, so FakeTTL=7 ensures the decoy reaches TSPU while
+// still safely expiring before foreign servers (12-20 hops).
 func defaultFakeTTLForPlatform() int {
-	return 5
+	return 7
 }
 
 // RequireLegacySocketProtect arms the protection barrier. It is used when the
