@@ -40,8 +40,8 @@ android {
         applicationId = "com.travonet.wireguard"
         minSdk = 28
         targetSdk = 37
-        versionCode = 1202
-        versionName = "1.2.0-2"
+        versionCode = 1203
+        versionName = "1.2.0-3"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 
