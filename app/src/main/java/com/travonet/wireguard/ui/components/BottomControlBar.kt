@@ -253,10 +253,30 @@ fun BottomControlBar(
                         Spacer(Modifier.width(6.dp))
                         Text("Стоп", fontWeight = FontWeight.Bold)
                     }
-                } else if (isBusy) {
+                } else if (tunnelState.status == TunnelStatus.CONNECTING) {
+                    Button(
+                        onClick = onStopClick,
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = MaterialTheme.colorScheme.errorContainer,
+                            contentColor = MaterialTheme.colorScheme.onErrorContainer
+                        ),
+                        elevation = ButtonDefaults.buttonElevation(defaultElevation = 0.dp, pressedElevation = 0.dp),
+                        modifier = Modifier.weight(0.65f),
+                        shape = RoundedCornerShape(12.dp),
+                        contentPadding = PaddingValues(horizontal = 16.dp, vertical = 11.dp)
+                    ) {
+                        CircularProgressIndicator(
+                            modifier = Modifier.size(16.dp),
+                            strokeWidth = 2.dp,
+                            color = MaterialTheme.colorScheme.onErrorContainer
+                        )
+                        Spacer(Modifier.width(8.dp))
+                        Text("Отмена", fontWeight = FontWeight.Bold)
+                    }
+                } else if (tunnelState.status == TunnelStatus.STOPPING) {
                     FilledTonalButton(
-                        onClick = {},
-                        enabled = false,
+                        onClick = onStopClick,
+                        enabled = true,
                         modifier = Modifier.weight(0.65f),
                         shape = RoundedCornerShape(12.dp),
                         contentPadding = PaddingValues(horizontal = 16.dp, vertical = 11.dp)
@@ -266,7 +286,7 @@ fun BottomControlBar(
                             strokeWidth = 2.dp
                         )
                         Spacer(Modifier.width(8.dp))
-                        Text("Ждите...")
+                        Text("Остановка...", fontSize = 13.sp)
                     }
                 } else {
                     Button(

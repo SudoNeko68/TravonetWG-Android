@@ -130,6 +130,21 @@ fun AddEditProfileDialog(
         confirmButton = {
             Button(
                 onClick = {
+                    val trimmed = rawConfig.trim()
+                    if (trimmed.startsWith("vpn://", ignoreCase = true)) {
+                        val parsedProfile = WgConfigParser.parseProfile(
+                            name = name.trim().ifBlank { "Amnezia Profile" },
+                            rawConfig = trimmed,
+                            id = profile?.id
+                        )
+                        if (!parsedProfile.rawConfig.contains("[Interface]", ignoreCase = true)) {
+                            errorMessage = "Не удалось извлечь WireGuard/AmneziaWG конфигурацию из ссылки vpn://"
+                            return@Button
+                        }
+                        onSave(parsedProfile)
+                        return@Button
+                    }
+
                     if (name.isBlank()) {
                         errorMessage = "Укажите название профиля"
                         return@Button

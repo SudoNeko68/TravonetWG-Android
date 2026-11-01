@@ -11,9 +11,13 @@ import com.travonet.wireguard.model.TunnelStatus
 import com.travonet.wireguard.model.WgProfile
 import com.travonet.wireguard.parser.WgConfigParser
 import com.travonet.wireguard.repository.AppRepository
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.launch
 
 object TunnelManager {
     private val _state = MutableStateFlow(TunnelState())
@@ -85,6 +89,26 @@ object TunnelManager {
         val currentMode = _state.value.mode
         updateState(status = TunnelStatus.STOPPING)
 
+        // Emergency safeguard: immediately terminate native handles if active
+        val currentVpnHandle = vpnHandle
+        if (currentVpnHandle >= 0) {
+            try {
+                org.travonet.backend.GoBackend.wgTurnOff(currentVpnHandle)
+            } catch (e: Exception) {
+                // ignore
+            }
+            vpnHandle = -1
+        }
+        val currentSocksHandle = socksHandle
+        if (currentSocksHandle >= 0) {
+            try {
+                org.travonet.backend.GoBackend.wgStopSocks5(currentSocksHandle)
+            } catch (e: Exception) {
+                // ignore
+            }
+            socksHandle = -1
+        }
+
         when (currentMode) {
             TunnelMode.VPN -> {
                 val intent = Intent(context, TravonetVpnService::class.java).apply {
@@ -97,6 +121,14 @@ object TunnelManager {
                     action = TravonetSocksService.ACTION_STOP
                 }
                 context.startService(intent)
+            }
+        }
+
+        // Failsafe watchdog: if state is still STOPPING or CONNECTING after 1.5s, force DISCONNECTED
+        kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.Main).launch {
+            kotlinx.coroutines.delay(1500)
+            if (_state.value.status == TunnelStatus.STOPPING || _state.value.status == TunnelStatus.CONNECTING) {
+                updateState(TunnelStatus.DISCONNECTED)
             }
         }
     }

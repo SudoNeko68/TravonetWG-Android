@@ -70,4 +70,8 @@ object GoBackend {
         relayUrl: String,
         relayToken: String
     ): String?
+
+    // Декодирует ссылку vpn:// от Amnezia, возвращает JSON {"name": "...", "config": "[Interface]..."}
+    @JvmStatic
+    external fun wgParseVPNURL(vpnUrl: String): String?
 }

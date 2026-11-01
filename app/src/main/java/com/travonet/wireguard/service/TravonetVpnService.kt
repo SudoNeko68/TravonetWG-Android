@@ -94,7 +94,7 @@ class TravonetVpnService : VpnService() {
             startJob?.cancel()
             startJob = serviceScope.launch {
                 tunnelMutex.withLock {
-                    startTunnelLocked(profile, strategy)
+                    startTunnelLocked(profile, strategy, 0)
                 }
             }
         }
@@ -104,7 +104,8 @@ class TravonetVpnService : VpnService() {
 
     private suspend fun startTunnelLocked(
         profile: com.travonet.wireguard.model.WgProfile,
-        strategy: com.travonet.wireguard.model.EvasionStrategy
+        strategy: com.travonet.wireguard.model.EvasionStrategy,
+        attempt: Int = 0
     ) {
         try {
             // Release only our own previous tunnel. A newer service instance
@@ -217,15 +218,12 @@ class TravonetVpnService : VpnService() {
 
             // wgTurnOnProtected применяет VpnService.protect(fd) к каждому
             // UDP-сокету ещё до bind(), поэтому handshake не может уйти в tun
-            // и зациклиться. Легаси-путь (wgTurnOn + protect после старта)
-            // здесь не нужен.
+            // и зациклиться.
             val handle = GoBackend.wgTurnOnProtected(
                 "wg0", tunFd, resolvedConfig, this@TravonetVpnService
             )
 
-            // The start may have been superseded by a newer ACTION_START (or
-            // the service may have been destroyed) while the blocking JNI
-            // call was running. Do not publish that tunnel.
+            // The start may have been superseded or cancelled while the blocking JNI call was running.
             if (!currentCoroutineContext().isActive || destroyed) {
                 if (handle >= 0) {
                     try {
@@ -234,6 +232,13 @@ class TravonetVpnService : VpnService() {
                         Log.e(TAG, "Error turning off superseded tunnel", e)
                     }
                 }
+                activeHandle = -1
+                if (TunnelManager.vpnHandle == handle) {
+                    TunnelManager.vpnHandle = -1
+                }
+                TunnelManager.updateState(TunnelStatus.DISCONNECTED)
+                stopForeground(STOP_FOREGROUND_REMOVE)
+                stopSelf()
                 return
             }
 
@@ -272,11 +277,21 @@ class TravonetVpnService : VpnService() {
                 stopForeground(STOP_FOREGROUND_REMOVE)
             }
             startStatsPolling(handle, profile.name, activeStrategyDesc)
-            startHandshakeWatchdog(handle, profile, strategy)
+            startHandshakeWatchdog(handle, profile, strategy, attempt)
 
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            Log.i(TAG, "startTunnel was cancelled")
+            releaseTunnelLocked()
+            TunnelManager.vpnHandle = -1
+            TunnelManager.updateState(TunnelStatus.DISCONNECTED)
+            stopForeground(STOP_FOREGROUND_REMOVE)
+            stopSelf()
         } catch (e: Throwable) {
             Log.e(TAG, "Fatal error in startTunnel", e)
+            releaseTunnelLocked()
+            TunnelManager.vpnHandle = -1
             TunnelManager.updateState(TunnelStatus.ERROR, e.localizedMessage ?: "Неизвестная ошибка")
+            stopForeground(STOP_FOREGROUND_REMOVE)
             stopSelf()
         }
     }
@@ -316,7 +331,8 @@ class TravonetVpnService : VpnService() {
     private fun startHandshakeWatchdog(
         handle: Int,
         profile: com.travonet.wireguard.model.WgProfile,
-        strategy: com.travonet.wireguard.model.EvasionStrategy
+        strategy: com.travonet.wireguard.model.EvasionStrategy,
+        attempt: Int = 0
     ) {
         healthJob?.cancel()
         healthJob = serviceScope.launch {
@@ -339,33 +355,32 @@ class TravonetVpnService : VpnService() {
             val repository = AppRepository(this@TravonetVpnService)
             if (!initialHandshakeReceived) {
                 if (TunnelManager.vpnHandle == handle &&
-                    TunnelManager.state.value.status == TunnelStatus.CONNECTED
+                    (TunnelManager.state.value.status == TunnelStatus.CONNECTED ||
+                     TunnelManager.state.value.status == TunnelStatus.CONNECTING)
                 ) {
-                    if (repository.isAutoReconnectEnabled()) {
-                        Log.w(TAG, "No WireGuard handshake; auto-reconnecting...")
-                        TunnelManager.updateState(TunnelStatus.CONNECTING, "Переподключение...")
+                    if (repository.isAutoReconnectEnabled() && attempt < 2) {
+                        Log.w(TAG, "No WireGuard handshake (attempt ${attempt + 1}/3); auto-reconnecting...")
+                        TunnelManager.updateState(TunnelStatus.CONNECTING, "Переподключение (попытка ${attempt + 2}/3)...")
                         tunnelMutex.withLock {
                             releaseTunnelLocked()
                         }
                         delay(2000)
                         if (isActive && !destroyed) {
                             tunnelMutex.withLock {
-                                startTunnelLocked(profile, strategy)
+                                startTunnelLocked(profile, strategy, attempt + 1)
                             }
                         }
                         return@launch
                     } else {
-                        Log.w(TAG, "No WireGuard handshake after ${HANDSHAKE_TIMEOUT_MS / 1000}s; tearing down")
-                        // Do not leave Android routing all traffic into a dead tunnel.
+                        Log.w(TAG, "No WireGuard handshake after attempts; tearing down")
                         tunnelMutex.withLock {
                             releaseTunnelLocked()
                         }
-                        if (TunnelManager.vpnHandle == -1) {
-                            TunnelManager.updateState(
-                                TunnelStatus.ERROR,
-                                "Handshake не получен за ${HANDSHAKE_TIMEOUT_MS / 1000} с. Смените профиль или стратегию."
-                            )
-                        }
+                        TunnelManager.vpnHandle = -1
+                        TunnelManager.updateState(
+                            TunnelStatus.ERROR,
+                            "Сервер не ответил на handshake (${if (attempt >= 2) "3 попытки" else "${HANDSHAKE_TIMEOUT_MS / 1000} с"}). Смените стратегию или профиль."
+                        )
                         stopForeground(STOP_FOREGROUND_REMOVE)
                         stopSelf()
                         return@launch
@@ -397,7 +412,7 @@ class TravonetVpnService : VpnService() {
                         delay(2000)
                         if (isActive && !destroyed) {
                             tunnelMutex.withLock {
-                                startTunnelLocked(profile, strategy)
+                                startTunnelLocked(profile, strategy, 0)
                             }
                         }
                         return@launch
@@ -410,18 +425,51 @@ class TravonetVpnService : VpnService() {
     }
 
     private fun stopTunnelAsync() {
+        Log.i(TAG, "stopTunnelAsync requested")
+        // 1. Immediately cancel active coroutines
         startJob?.cancel()
+        healthJob?.cancel()
+        statsJob?.cancel()
+        healthJob = null
+        statsJob = null
+
+        // 2. Direct emergency kill if handle exists, without waiting for mutex lock
+        val currentHandle = activeHandle
+        val globalHandle = TunnelManager.vpnHandle
+        val handleToKill = if (currentHandle >= 0) currentHandle else globalHandle
+        if (handleToKill >= 0) {
+            try {
+                GoBackend.wgTurnOff(handleToKill)
+            } catch (e: Exception) {
+                Log.e(TAG, "Error in emergency wgTurnOff", e)
+            }
+        }
+        activeHandle = -1
+        TunnelManager.vpnHandle = -1
+
+        try {
+            activePfd?.close()
+        } catch (e: Exception) {
+            // ignore
+        }
+        activePfd = null
+
+        TunnelManager.updateState(TunnelStatus.DISCONNECTED)
+        stopForeground(STOP_FOREGROUND_REMOVE)
+
+        // 3. Clean up the rest under mutex asynchronously and stop service
         serviceScope.launch {
-            tunnelMutex.withLock {
-                releaseTunnelLocked()
-            }
-            // If a newer ACTION_START already created a tunnel, its state must
-            // not be overwritten by this stop.
-            if (TunnelManager.vpnHandle == -1) {
+            try {
+                tunnelMutex.withLock {
+                    releaseTunnelLocked()
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "Error in releaseTunnelLocked during stop", e)
+            } finally {
                 TunnelManager.updateState(TunnelStatus.DISCONNECTED)
+                stopForeground(STOP_FOREGROUND_REMOVE)
+                stopSelf()
             }
-            stopForeground(STOP_FOREGROUND_REMOVE)
-            stopSelf()
         }
     }
 

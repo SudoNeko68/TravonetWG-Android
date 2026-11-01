@@ -118,16 +118,18 @@ fun MainScreen(
         val clip = cm.primaryClip
         if (clip != null && clip.itemCount > 0) {
             val text = clip.getItemAt(0).text?.toString() ?: ""
-            if (text.contains("[Interface]", ignoreCase = true)) {
+            val isWg = text.contains("[Interface]", ignoreCase = true)
+            val isVpnUrl = text.trimStart().startsWith("vpn://", ignoreCase = true)
+            if (isWg || isVpnUrl) {
                 val profile = WgConfigParser.parseProfile("Профиль из буфера", text)
                 repository.addOrUpdateProfile(profile)
                 profiles = repository.getProfiles()
                 selectedProfileId = profile.id
                 repository.setSelectedProfileId(profile.id)
                 selectedTab = 0
-                Toast.makeText(context, "Импортировано из буфера!", Toast.LENGTH_SHORT).show()
+                Toast.makeText(context, "Импортировано: ${profile.name}", Toast.LENGTH_SHORT).show()
             } else {
-                Toast.makeText(context, "Буфер обмена не содержит конфигурацию WireGuard", Toast.LENGTH_SHORT).show()
+                Toast.makeText(context, "Буфер обмена не содержит конфигурацию WireGuard или vpn://", Toast.LENGTH_SHORT).show()
             }
         } else {
             Toast.makeText(context, "Буфер обмена пуст", Toast.LENGTH_SHORT).show()

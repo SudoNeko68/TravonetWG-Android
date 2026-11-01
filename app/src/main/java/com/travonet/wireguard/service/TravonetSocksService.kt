@@ -29,6 +29,7 @@ import org.travonet.backend.GoBackend
 class TravonetSocksService : Service() {
 
     private val serviceScope = CoroutineScope(Dispatchers.IO)
+    private var startJob: Job? = null
     private var statsJob: Job? = null
 
     companion object {
@@ -82,7 +83,8 @@ class TravonetSocksService : Service() {
         strategy: com.travonet.wireguard.model.EvasionStrategy,
         listenAddr: String
     ) {
-        serviceScope.launch {
+        startJob?.cancel()
+        startJob = serviceScope.launch {
             try {
                 if (TunnelManager.socksHandle >= 0) {
                     try {
@@ -120,9 +122,17 @@ class TravonetSocksService : Service() {
                 startForegroundServiceNotification(profile.name, listenAddr, "Прокси активен на $listenAddr")
                 startStatsPolling(handle, profile.name, listenAddr)
 
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                Log.i(TAG, "startProxy was cancelled")
+                TunnelManager.socksHandle = -1
+                TunnelManager.updateState(TunnelStatus.DISCONNECTED)
+                stopForeground(STOP_FOREGROUND_REMOVE)
+                stopSelf()
             } catch (e: Throwable) {
                 Log.e(TAG, "Error starting socks proxy", e)
+                TunnelManager.socksHandle = -1
                 TunnelManager.updateState(TunnelStatus.ERROR, e.localizedMessage ?: "Неизвестная ошибка")
+                stopForeground(STOP_FOREGROUND_REMOVE)
                 stopSelf()
             }
         }
@@ -147,6 +157,8 @@ class TravonetSocksService : Service() {
     }
 
     private fun stopProxy() {
+        startJob?.cancel()
+        startJob = null
         statsJob?.cancel()
         statsJob = null
 

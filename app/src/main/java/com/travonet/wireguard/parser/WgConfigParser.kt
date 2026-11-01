@@ -142,7 +142,31 @@ object WgConfigParser {
     }
 
     fun parseProfile(name: String, rawConfig: String, id: String? = null): WgProfile {
-        val parsed = parse(rawConfig)
+        var effectiveName = name
+        var effectiveConfig = rawConfig.trim()
+
+        if (effectiveConfig.startsWith("vpn://", ignoreCase = true)) {
+            try {
+                val jsonResult = org.travonet.backend.GoBackend.wgParseVPNURL(effectiveConfig)
+                if (jsonResult != null && !jsonResult.startsWith("ERROR:")) {
+                    val obj = org.json.JSONObject(jsonResult)
+                    val parsedName = obj.optString("name")
+                    val parsedConfig = obj.optString("config")
+                    if (parsedConfig.isNotBlank()) {
+                        effectiveConfig = parsedConfig
+                        if (name.isBlank() || name == "Профиль из буфера" || name == "Новая конфигурация" || name.startsWith("vpn://")) {
+                            if (parsedName.isNotBlank()) {
+                                effectiveName = parsedName
+                            }
+                        }
+                    }
+                }
+            } catch (e: Exception) {
+                android.util.Log.e("WgConfigParser", "Error parsing vpn:// via GoBackend", e)
+            }
+        }
+
+        val parsed = parse(effectiveConfig)
         val endpoint = parsed.peers.firstOrNull()?.endpoint ?: ""
         val address = parsed.iface.addresses.joinToString(", ")
         val allowedIps = parsed.peers.flatMap { it.allowedIps }.joinToString(", ")
@@ -151,8 +175,8 @@ object WgConfigParser {
 
         return WgProfile(
             id = id ?: java.util.UUID.randomUUID().toString(),
-            name = name,
-            rawConfig = rawConfig,
+            name = effectiveName,
+            rawConfig = effectiveConfig,
             endpoint = endpoint,
             address = address,
             allowedIps = allowedIps,
@@ -276,7 +300,10 @@ object WgConfigParser {
         }
 
         return try {
-            val addrs = java.net.InetAddress.getAllByName(host)
+            val future = java.util.concurrent.CompletableFuture.supplyAsync {
+                java.net.InetAddress.getAllByName(host)
+            }
+            val addrs = future.get(3500, java.util.concurrent.TimeUnit.MILLISECONDS)
             val ipv4 = addrs.firstOrNull { it is java.net.Inet4Address }
             if (ipv4 != null) {
                 "${ipv4.hostAddress}:$port"

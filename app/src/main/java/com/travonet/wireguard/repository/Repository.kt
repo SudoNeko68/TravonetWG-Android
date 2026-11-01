@@ -18,7 +18,7 @@ class AppRepository(context: Context) {
     companion object {
         // Пресеты живут в отдельном объекте, чтобы их можно было проверить unit-тестами.
         val DEFAULT_STRATEGIES = DefaultStrategies.ALL
-        const val DEFAULT_BUILTIN_WARP_RELAY_URL = "https://larp.футанари.рф/register"
+        const val DEFAULT_BUILTIN_WARP_RELAY_URL = "https://larp.футанари.рф/register,https://larp.travonet.ru/register"
         const val DEFAULT_BUILTIN_WARP_RELAY_TOKEN = "e11ced0fba59e86a5c0c385d5ab53de072e5c5d7bc7157aea832188a790dd678"
     }
 
