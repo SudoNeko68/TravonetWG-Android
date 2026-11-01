@@ -141,11 +141,17 @@ object WgConfigParser {
         )
     }
 
-    fun parseProfile(name: String, rawConfig: String, id: String? = null): WgProfile {
+    fun parseProfile(
+        name: String,
+        rawConfig: String,
+        id: String? = null,
+        subscriptionUrl: String? = null
+    ): WgProfile {
         var effectiveName = name
         var effectiveConfig = rawConfig.trim()
 
         if (effectiveConfig.startsWith("vpn://", ignoreCase = true)) {
+            var parsedViaNative = false
             try {
                 val jsonResult = org.travonet.backend.GoBackend.wgParseVPNURL(effectiveConfig)
                 if (jsonResult != null && !jsonResult.startsWith("ERROR:")) {
@@ -154,15 +160,31 @@ object WgConfigParser {
                     val parsedConfig = obj.optString("config")
                     if (parsedConfig.isNotBlank()) {
                         effectiveConfig = parsedConfig
-                        if (name.isBlank() || name == "Профиль из буфера" || name == "Новая конфигурация" || name.startsWith("vpn://")) {
+                        parsedViaNative = true
+                        if (name.isBlank() || name == "Профиль из буфера" || name == "Новая конфигурация" || name.startsWith("vpn://") || name.startsWith("Профиль ")) {
                             if (parsedName.isNotBlank()) {
                                 effectiveName = parsedName
                             }
                         }
                     }
                 }
-            } catch (e: Exception) {
-                android.util.Log.e("WgConfigParser", "Error parsing vpn:// via GoBackend", e)
+            } catch (e: Throwable) {
+                // GoBackend JNI may be absent in JVM tests or fail to load
+            }
+
+            // Fallback for raw INI Base64 payloads when native library is not available
+            if (!parsedViaNative) {
+                val payload = effectiveConfig.substring(6).trim().trimEnd('.', ',', '/', '?', '#', ';')
+                val decoded = tryDecodeBase64(payload)
+                if (decoded != null && decoded.contains("[Interface]", ignoreCase = true)) {
+                    effectiveConfig = decoded
+                    if (name.isBlank() || name == "Профиль из буфера" || name == "Новая конфигурация" || name.startsWith("vpn://") || name.startsWith("Профиль ")) {
+                        val endpoint = decoded.lines()
+                            .firstOrNull { it.trim().startsWith("endpoint", ignoreCase = true) }
+                            ?.substringAfter("=")?.trim()?.substringBefore(":")
+                        effectiveName = if (!endpoint.isNullOrBlank()) "AmneziaWG ($endpoint)" else "AmneziaWG"
+                    }
+                }
             }
         }
 
@@ -183,7 +205,8 @@ object WgConfigParser {
             dns = dns,
             mtu = parsed.iface.mtu,
             hasEmbeddedStrategy = hasStrategy,
-            embeddedStrategy = parsed.iface.strategy
+            embeddedStrategy = parsed.iface.strategy,
+            subscriptionUrl = subscriptionUrl
         )
     }
 
@@ -313,5 +336,35 @@ object WgConfigParser {
         } catch (_: Exception) {
             endpoint
         }
+    }
+
+    private fun tryDecodeBase64(input: String): String? {
+        val sanitized = input.replace("\r", "").replace("\n", "").replace(" ", "").trim()
+        if (sanitized.isEmpty()) return null
+
+        val decoders = listOfNotNull(
+            runCatching { java.util.Base64.getDecoder() }.getOrNull(),
+            runCatching { java.util.Base64.getUrlDecoder() }.getOrNull()
+        )
+        for (decoder in decoders) {
+            try {
+                val bytes = decoder.decode(sanitized)
+                if (bytes != null && bytes.isNotEmpty()) {
+                    return String(bytes, java.nio.charset.StandardCharsets.UTF_8)
+                }
+            } catch (_: Exception) {}
+
+            val rem = sanitized.length % 4
+            if (rem != 0) {
+                try {
+                    val padded = sanitized + "=".repeat(4 - rem)
+                    val bytes = decoder.decode(padded)
+                    if (bytes != null && bytes.isNotEmpty()) {
+                        return String(bytes, java.nio.charset.StandardCharsets.UTF_8)
+                    }
+                } catch (_: Exception) {}
+            }
+        }
+        return null
     }
 }

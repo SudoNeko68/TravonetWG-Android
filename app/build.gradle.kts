@@ -40,8 +40,8 @@ android {
         applicationId = "com.travonet.wireguard"
         minSdk = 28
         targetSdk = 37
-        versionCode = 1203
-        versionName = "1.2.0-3"
+        versionCode = 1204
+        versionName = "1.2.0-4"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 
@@ -78,6 +78,11 @@ android {
         compose = true
         buildConfig = true
     }
+    packaging {
+        jniLibs {
+            excludes += "**/libwg-go.so"
+        }
+    }
 }
 
 dependencies {
@@ -91,6 +96,7 @@ dependencies {
     implementation(libs.androidx.core.ktx)
     implementation(libs.androidx.lifecycle.runtime.ktx)
     testImplementation(libs.junit)
+    testImplementation("org.json:json:20240303")
     androidTestImplementation(platform(libs.androidx.compose.bom))
     androidTestImplementation(libs.androidx.compose.ui.test.junit4)
     androidTestImplementation(libs.androidx.espresso.core)

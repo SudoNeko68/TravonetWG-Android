@@ -276,4 +276,136 @@ class TravonetUnitTest {
         assertEquals("2606:4700:d0::a29f:c001", com.travonet.wireguard.service.PingHelper.extractHost("[2606:4700:d0::a29f:c001]:2408"))
         assertEquals("1.1.1.1", com.travonet.wireguard.service.PingHelper.extractHost("1.1.1.1"))
     }
+
+    @Test
+    fun testSubscriptionTitleBase64() {
+        val title = com.travonet.wireguard.subscription.SubscriptionFetcher.parseProfileTitle("base64:VHJhdm9uZXQ=")
+        assertEquals("Travonet", title)
+
+        val plainTitle = com.travonet.wireguard.subscription.SubscriptionFetcher.parseProfileTitle("My Custom Title")
+        assertEquals("My Custom Title", plainTitle)
+    }
+
+    @Test
+    fun testSubscriptionBodyDecoding() {
+        val rawIni = """
+            [Interface]
+            PrivateKey = OCugIHnrk/r8Zdtd5AGYIchdMag+dqXF08yn1AZ2aUw=
+            Address = 10.8.0.2/32
+            
+            [Peer]
+            PublicKey = bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=
+            Endpoint = 198.51.100.1:51820
+            AllowedIPs = 0.0.0.0/0
+        """.trimIndent()
+
+        val b64Body = java.util.Base64.getEncoder().encodeToString(rawIni.toByteArray())
+        val profiles = com.travonet.wireguard.subscription.SubscriptionFetcher.parseSubscriptionBody(b64Body, "Travonet Server")
+
+        assertEquals(1, profiles.size)
+        assertEquals("Travonet Server", profiles[0].name)
+        assertEquals("198.51.100.1:51820", profiles[0].endpoint)
+        assertEquals("10.8.0.2/32", profiles[0].address)
+    }
+
+    @Test
+    fun testRealTravonetSubscriptionFetch() {
+        val url = "https://travonet.ru:2096/sub/9o4ncb577c41xfqi"
+        val result1 = com.travonet.wireguard.subscription.SubscriptionFetcher.fetchSubscription(url)
+        assertEquals("Travonet", result1.title)
+        assertNotNull(result1.profiles)
+        assertTrue("Profiles should not be empty", result1.profiles.isNotEmpty())
+
+        val result2 = com.travonet.wireguard.subscription.SubscriptionFetcher.fetchSubscription(url)
+        // IDs must be deterministic so that updating the subscription replaces profiles instead of duplicating
+        assertEquals(result1.profiles.size, result2.profiles.size)
+        assertEquals(result1.profiles[0].id, result2.profiles[0].id)
+        assertEquals(url, result1.profiles[0].subscriptionUrl)
+    }
+
+    @Test
+    fun testRegexClipboardDetection() {
+        val httpRegex = Regex("""https?://[^\s"'<>]+""", RegexOption.IGNORE_CASE)
+        val vpnRegex = Regex("""vpn://[^\s"'<>]+""", RegexOption.IGNORE_CASE)
+        val interfaceRegex = Regex("""\[Interface\]""", RegexOption.IGNORE_CASE)
+
+        // 1. Subscription URL
+        val subText = "Вот держи подписку https://travonet.ru:2096/sub/9o4ncb577c41xfqi."
+        val httpMatch = httpRegex.find(subText)
+        assertNotNull(httpMatch)
+        assertEquals("https://travonet.ru:2096/sub/9o4ncb577c41xfqi.", httpMatch!!.value)
+        assertEquals("https://travonet.ru:2096/sub/9o4ncb577c41xfqi", httpMatch.value.trimEnd('.', ',', ';'))
+
+        // 2. vpn:// link
+        val vpnText = "Подключайся vpn://W0ludGVyZmFjZV0KUHJpdmF0ZUtleSA9... спасибо"
+        val vpnMatch = vpnRegex.find(vpnText)
+        assertNotNull(vpnMatch)
+        assertEquals("vpn://W0ludGVyZmFjZV0KUHJpdmF0ZUtleSA9...", vpnMatch!!.value)
+
+        // 3. [Interface] config
+        val confText = "# My WG config\n[Interface]\nPrivateKey = abc\n[Peer]\nPublicKey = def\n"
+        assertTrue(interfaceRegex.containsMatchIn(confText))
+        assertFalse(interfaceRegex.containsMatchIn("vpn://W0ludGVy..."))
+    }
+
+    @Test
+    fun testSubscriptionUserInfoParsingAndFormatting() {
+        val rawUserInfo = "upload=104857600; download=209715200; total=1073741824; expire=1770508800"
+        val parsed = com.travonet.wireguard.model.Subscription.parseUserInfo(rawUserInfo)
+        assertEquals(104857600L, parsed.upload)
+        assertEquals(209715200L, parsed.download)
+        assertEquals(1073741824L, parsed.total)
+        assertEquals(1770508800L, parsed.expire)
+
+        val sub = com.travonet.wireguard.model.Subscription(
+            url = "https://example.com/sub/123",
+            title = "Test Sub",
+            lastUpdate = 1730000000000L,
+            updateIntervalHours = 12,
+            uploadBytes = parsed.upload,
+            downloadBytes = parsed.download,
+            totalBytes = parsed.total,
+            expireTimeSec = parsed.expire
+        )
+
+        // 300 MB / 1.00 GB
+        val traffic = sub.formattedTraffic()
+        assertNotNull(traffic)
+        assertTrue(traffic!!.contains("300.0 MB") && traffic.contains("1.0 GB"))
+
+        val expire = sub.formattedExpire()
+        assertNotNull(expire)
+        assertTrue(expire!!.startsWith("Истекает: "))
+
+        // JSON serialization round-trip
+        val json = sub.toJson()
+        val restored = com.travonet.wireguard.model.Subscription.fromJson(json)
+        assertEquals(sub.url, restored.url)
+        assertEquals(sub.title, restored.title)
+        assertEquals(sub.lastUpdate, restored.lastUpdate)
+        assertEquals(sub.updateIntervalHours, restored.updateIntervalHours)
+        assertEquals(sub.uploadBytes, restored.uploadBytes)
+        assertEquals(sub.downloadBytes, restored.downloadBytes)
+        assertEquals(sub.totalBytes, restored.totalBytes)
+        assertEquals(sub.expireTimeSec, restored.expireTimeSec)
+    }
+
+    @Test
+    fun testUnlimitedSubscriptionTrafficFormatting() {
+        val rawUserInfo = "upload=500000000; download=0; total=0; expire=0"
+        val parsed = com.travonet.wireguard.model.Subscription.parseUserInfo(rawUserInfo)
+        val sub = com.travonet.wireguard.model.Subscription(
+            url = "https://example.com/unlimited",
+            title = "Unlimited Sub",
+            uploadBytes = parsed.upload,
+            downloadBytes = parsed.download,
+            totalBytes = parsed.total,
+            expireTimeSec = parsed.expire
+        )
+        val traffic = sub.formattedTraffic()
+        assertNotNull(traffic)
+        assertTrue("Should contain infinity symbol", traffic!!.contains("∞"))
+        assertNull("Zero expire time should return null", sub.formattedExpire())
+    }
 }
+

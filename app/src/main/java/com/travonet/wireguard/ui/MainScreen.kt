@@ -9,6 +9,8 @@ import androidx.compose.animation.core.FastOutSlowInEasing
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.pager.HorizontalPager
+import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
@@ -21,6 +23,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.travonet.wireguard.model.EvasionStrategy
+import com.travonet.wireguard.model.Subscription
 import com.travonet.wireguard.model.TunnelMode
 import com.travonet.wireguard.model.WarpRelayMode
 import com.travonet.wireguard.model.WgProfile
@@ -29,9 +32,11 @@ import com.travonet.wireguard.repository.AppRepository
 import com.travonet.wireguard.service.PingHelper
 import com.travonet.wireguard.service.PingResult
 import com.travonet.wireguard.service.TunnelManager
+import com.travonet.wireguard.subscription.SubscriptionFetcher
 import com.travonet.wireguard.ui.components.BottomControlBar
 import com.travonet.wireguard.ui.dialogs.AddEditProfileDialog
 import com.travonet.wireguard.ui.dialogs.AppSettingsDialog
+import com.travonet.wireguard.ui.dialogs.SubscriptionDialog
 import com.travonet.wireguard.ui.dialogs.WarpProgressDialog
 import com.travonet.wireguard.ui.dialogs.WarpRelayDialog
 import com.travonet.wireguard.ui.dialogs.WarpUiState
@@ -54,7 +59,7 @@ fun MainScreen(
     val context = LocalContext.current
     val repository = remember { AppRepository(context) }
 
-    var selectedTab by remember { mutableIntStateOf(0) }
+    val pagerState = rememberPagerState(pageCount = { 2 })
     var profiles by remember { mutableStateOf(repository.getProfiles()) }
     var selectedProfileId by remember { mutableStateOf(repository.getSelectedProfileId()) }
 
@@ -81,6 +86,14 @@ fun MainScreen(
     var warpRelayMode by remember { mutableStateOf(repository.getWarpRelayMode()) }
     var warpRelayUrl by remember { mutableStateOf(repository.getWarpRelayUrl()) }
     var warpRelayToken by remember { mutableStateOf(repository.getWarpRelayToken()) }
+
+    var showSubscriptionDialog by remember { mutableStateOf(false) }
+    var isFetchingSubscription by remember { mutableStateOf(false) }
+    var updatingSubscriptionUrls by remember { mutableStateOf<Set<String>>(emptySet()) }
+    var subscriptionErrorMessage by remember { mutableStateOf<String?>(null) }
+    var subscriptionUrl by remember { mutableStateOf(repository.getSubscriptionUrl() ?: "") }
+    var subscriptions by remember { mutableStateOf(repository.getSubscriptions()) }
+
     val scope = rememberCoroutineScope()
 
     val activeFallbackStrategy = remember(strategies, selectedStrategyId) {
@@ -105,7 +118,7 @@ fun MainScreen(
                 profiles = repository.getProfiles()
                 selectedProfileId = profile.id
                 repository.setSelectedProfileId(profile.id)
-                selectedTab = 0
+                scope.launch { pagerState.animateScrollToPage(0) }
                 Toast.makeText(context, "Конфигурация импортирована!", Toast.LENGTH_SHORT).show()
             } catch (e: Exception) {
                 Toast.makeText(context, "Ошибка чтения файла: ${e.localizedMessage}", Toast.LENGTH_LONG).show()
@@ -113,23 +126,124 @@ fun MainScreen(
         }
     }
 
+    fun fetchSubscription(urlStr: String) {
+        if (updatingSubscriptionUrls.contains(urlStr)) return
+        updatingSubscriptionUrls = updatingSubscriptionUrls + urlStr
+        isFetchingSubscription = true
+        subscriptionErrorMessage = null
+        scope.launch {
+            val result = withContext(Dispatchers.IO) {
+                runCatching {
+                    SubscriptionFetcher.fetchSubscription(urlStr)
+                }
+            }
+            result.onSuccess { subResult ->
+                val parsed = Subscription.parseUserInfo(subResult.userInfo)
+                val newSub = Subscription(
+                    url = urlStr,
+                    title = subResult.title,
+                    lastUpdate = System.currentTimeMillis(),
+                    updateIntervalHours = subResult.updateIntervalHours,
+                    uploadBytes = parsed.upload,
+                    downloadBytes = parsed.download,
+                    totalBytes = parsed.total,
+                    expireTimeSec = parsed.expire
+                )
+                repository.addOrUpdateSubscription(newSub)
+                repository.replaceSubscriptionProfiles(urlStr, subResult.profiles)
+                profiles = repository.getProfiles()
+                subscriptions = repository.getSubscriptions()
+                subscriptionUrl = repository.getSubscriptionUrl() ?: ""
+                if (selectedProfileId == null || profiles.none { it.id == selectedProfileId }) {
+                    selectedProfileId = subResult.profiles.firstOrNull()?.id
+                    repository.setSelectedProfileId(selectedProfileId)
+                }
+                scope.launch { pagerState.animateScrollToPage(0) }
+                updatingSubscriptionUrls = updatingSubscriptionUrls - urlStr
+                isFetchingSubscription = updatingSubscriptionUrls.isNotEmpty()
+                showSubscriptionDialog = false
+                Toast.makeText(
+                    context,
+                    "Подписка «${subResult.title}» обновлена: ${subResult.profiles.size} конф.",
+                    Toast.LENGTH_LONG
+                ).show()
+            }.onFailure { err ->
+                updatingSubscriptionUrls = updatingSubscriptionUrls - urlStr
+                isFetchingSubscription = updatingSubscriptionUrls.isNotEmpty()
+                subscriptionErrorMessage = err.localizedMessage ?: "Ошибка загрузки подписки"
+                Toast.makeText(context, "Ошибка подписки: ${err.localizedMessage}", Toast.LENGTH_LONG).show()
+            }
+        }
+    }
+
+    fun deleteSubscription(url: String) {
+        repository.deleteSubscription(url)
+        subscriptions = repository.getSubscriptions()
+        profiles = repository.getProfiles()
+        selectedProfileId = repository.getSelectedProfileId()
+        subscriptionUrl = repository.getSubscriptionUrl() ?: ""
+        Toast.makeText(context, "Подписка удалена", Toast.LENGTH_SHORT).show()
+    }
+
     fun pasteFromClipboard() {
         val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
         val clip = cm.primaryClip
         if (clip != null && clip.itemCount > 0) {
-            val text = clip.getItemAt(0).text?.toString() ?: ""
-            val isWg = text.contains("[Interface]", ignoreCase = true)
-            val isVpnUrl = text.trimStart().startsWith("vpn://", ignoreCase = true)
-            if (isWg || isVpnUrl) {
-                val profile = WgConfigParser.parseProfile("Профиль из буфера", text)
-                repository.addOrUpdateProfile(profile)
-                profiles = repository.getProfiles()
-                selectedProfileId = profile.id
-                repository.setSelectedProfileId(profile.id)
-                selectedTab = 0
-                Toast.makeText(context, "Импортировано: ${profile.name}", Toast.LENGTH_SHORT).show()
-            } else {
-                Toast.makeText(context, "Буфер обмена не содержит конфигурацию WireGuard или vpn://", Toast.LENGTH_SHORT).show()
+            val rawText = clip.getItemAt(0).text?.toString() ?: ""
+            val text = rawText.trim()
+            if (text.isBlank()) {
+                Toast.makeText(context, "Буфер обмена пуст", Toast.LENGTH_SHORT).show()
+                return
+            }
+
+            val httpRegex = Regex("""https?://[^\s"'<>]+""", RegexOption.IGNORE_CASE)
+            val vpnRegex = Regex("""vpn://[^\s"'<>]+""", RegexOption.IGNORE_CASE)
+            val interfaceRegex = Regex("""\[Interface\]""", RegexOption.IGNORE_CASE)
+
+            val httpMatch = httpRegex.find(text)
+            val vpnMatch = vpnRegex.find(text)
+            val hasInterface = interfaceRegex.containsMatchIn(text)
+
+            when {
+                // Subscription URL (if not inside an INI comment)
+                httpMatch != null && !hasInterface -> {
+                    val url = httpMatch.value.trim().trimEnd('.', ',', ';')
+                    subscriptionUrl = url
+                    Toast.makeText(context, "Загрузка подписки...", Toast.LENGTH_SHORT).show()
+                    fetchSubscription(url)
+                }
+                // AmneziaWG vpn:// URL
+                vpnMatch != null && !hasInterface -> {
+                    val vpnUrl = vpnMatch.value.trim().trimEnd('.', ',', ';')
+                    val profile = WgConfigParser.parseProfile("Профиль из буфера", vpnUrl)
+                    if (profile.rawConfig.contains("[Interface]", ignoreCase = true)) {
+                        repository.addOrUpdateProfile(profile)
+                        profiles = repository.getProfiles()
+                        selectedProfileId = profile.id
+                        repository.setSelectedProfileId(profile.id)
+                        scope.launch { pagerState.animateScrollToPage(0) }
+                        Toast.makeText(context, "Импортировано: ${profile.name}", Toast.LENGTH_SHORT).show()
+                    } else {
+                        Toast.makeText(context, "Не удалось разобрать ссылку vpn://", Toast.LENGTH_SHORT).show()
+                    }
+                }
+                // WireGuard / AmneziaWG .conf configuration
+                hasInterface -> {
+                    val profile = WgConfigParser.parseProfile("Профиль из буфера", text)
+                    repository.addOrUpdateProfile(profile)
+                    profiles = repository.getProfiles()
+                    selectedProfileId = profile.id
+                    repository.setSelectedProfileId(profile.id)
+                    scope.launch { pagerState.animateScrollToPage(0) }
+                    Toast.makeText(context, "Импортировано: ${profile.name}", Toast.LENGTH_SHORT).show()
+                }
+                else -> {
+                    Toast.makeText(
+                        context,
+                        "Буфер не содержит конфигурацию ([Interface]), ссылку vpn:// или URL подписки",
+                        Toast.LENGTH_LONG
+                    ).show()
+                }
             }
         } else {
             Toast.makeText(context, "Буфер обмена пуст", Toast.LENGTH_SHORT).show()
@@ -153,7 +267,7 @@ fun MainScreen(
                 profiles = repository.getProfiles()
                 selectedProfileId = profile.id
                 repository.setSelectedProfileId(profile.id)
-                selectedTab = 0
+                scope.launch { pagerState.animateScrollToPage(0) }
                 warpUiState = WarpUiState.Success(profile.name, profile.endpoint)
             }.onFailure { error ->
                 warpUiState = WarpUiState.Failure(
@@ -164,11 +278,11 @@ fun MainScreen(
         }
     }
 
-    fun pingAllProfiles() {
-        if (isTestingAll || profiles.isEmpty()) return
+    fun pingProfilesSubset(targetProfiles: List<WgProfile>) {
+        if (isTestingAll || targetProfiles.isEmpty()) return
         isTestingAll = true
         scope.launch {
-            for (profile in profiles) {
+            for (profile in targetProfiles) {
                 pingResults = pingResults + (profile.id to PingResult(isTesting = true))
                 val udpPing = PingHelper.pingUdpHost(profile.endpoint)
                 if (udpPing != null) {
@@ -198,6 +312,10 @@ fun MainScreen(
             }
             isTestingAll = false
         }
+    }
+
+    fun pingAllProfiles() {
+        pingProfilesSubset(profiles)
     }
 
     fun pingSelectedProfile() {
@@ -256,7 +374,11 @@ fun MainScreen(
                             onPasteFromClipboard = { pasteFromClipboard() },
                             onImportFromFile = { filePickerLauncher.launch("*/*") },
                             onGenerateWarp = { generateWarp() },
-                            onCreateManual = { isAddingProfile = true }
+                            onCreateManual = { isAddingProfile = true },
+                            onOpenSubscription = { showSubscriptionDialog = true },
+                            onUpdateSubscription = if (subscriptionUrl.isNotBlank()) {
+                                { fetchSubscription(subscriptionUrl) }
+                            } else null
                         )
 
                         IconButton(onClick = { showInfoDialog = true }) {
@@ -268,31 +390,35 @@ fun MainScreen(
                     )
                 )
 
-                // The two top tab switchers requested by user
+                // The two top tab switchers with swipe pager support
                 PrimaryTabRow(
-                    selectedTabIndex = selectedTab,
+                    selectedTabIndex = pagerState.currentPage,
                     containerColor = MaterialTheme.colorScheme.surface
                 ) {
                     Tab(
-                        selected = selectedTab == 0,
-                        onClick = { selectedTab = 0 },
+                        selected = pagerState.currentPage == 0,
+                        onClick = {
+                            scope.launch { pagerState.animateScrollToPage(0) }
+                        },
                         text = {
                             Row(verticalAlignment = androidx.compose.ui.Alignment.CenterVertically) {
                                 Icon(Icons.Default.Dns, contentDescription = null, modifier = Modifier.size(16.dp))
                                 Spacer(Modifier.width(6.dp))
-                                Text("Конфигурации (${profiles.size})", fontWeight = if (selectedTab == 0) FontWeight.Bold else FontWeight.Normal)
+                                Text("Конфигурации (${profiles.size})", fontWeight = if (pagerState.currentPage == 0) FontWeight.Bold else FontWeight.Normal)
                             }
                         }
                     )
 
                     Tab(
-                        selected = selectedTab == 1,
-                        onClick = { selectedTab = 1 },
+                        selected = pagerState.currentPage == 1,
+                        onClick = {
+                            scope.launch { pagerState.animateScrollToPage(1) }
+                        },
                         text = {
                             Row(verticalAlignment = androidx.compose.ui.Alignment.CenterVertically) {
                                 Icon(Icons.Default.Bolt, contentDescription = null, modifier = Modifier.size(16.dp))
                                 Spacer(Modifier.width(6.dp))
-                                Text("Стратегии обхода", fontWeight = if (selectedTab == 1) FontWeight.Bold else FontWeight.Normal)
+                                Text("Стратегии обхода", fontWeight = if (pagerState.currentPage == 1) FontWeight.Bold else FontWeight.Normal)
                             }
                         }
                     )
@@ -327,20 +453,23 @@ fun MainScreen(
             )
         }
     ) { innerPadding ->
-        Box(
+        HorizontalPager(
+            state = pagerState,
             modifier = Modifier
                 .fillMaxSize()
                 .padding(innerPadding)
-        ) {
-            when (selectedTab) {
+        ) { page ->
+            when (page) {
                 0 -> ConfigsScreen(
                     profiles = profiles,
+                    subscriptions = subscriptions,
                     selectedProfileId = selectedProfileId,
                     fallbackStrategy = activeFallbackStrategy,
                     showAddresses = showAddresses,
                     pingResults = pingResults,
                     isTestingAll = isTestingAll,
                     onPingAllProfiles = { pingAllProfiles() },
+                    onPingProfiles = { subset -> pingProfilesSubset(subset) },
                     onSelectProfile = { id ->
                         selectedProfileId = id
                         repository.setSelectedProfileId(id)
@@ -354,10 +483,20 @@ fun MainScreen(
                         profiles = repository.getProfiles()
                         selectedProfileId = repository.getSelectedProfileId()
                     },
+                    onDeleteSubscription = { url -> deleteSubscription(url) },
                     onGenerateWarp = { generateWarp() },
                     onOpenAddManual = { isAddingProfile = true },
                     onPasteFromClipboard = { pasteFromClipboard() },
-                    onImportFromFile = { filePickerLauncher.launch("*/*") }
+                    onImportFromFile = { filePickerLauncher.launch("*/*") },
+                    onOpenSubscription = { showSubscriptionDialog = true },
+                    hasSubscription = subscriptions.isNotEmpty() || subscriptionUrl.isNotBlank(),
+                    onUpdateSubscription = {
+                        val targetUrl = subscriptions.firstOrNull()?.url ?: subscriptionUrl
+                        if (targetUrl.isNotBlank()) fetchSubscription(targetUrl)
+                    },
+                    onUpdateSpecificSubscription = { url -> fetchSubscription(url) },
+                    updatingSubscriptionUrls = updatingSubscriptionUrls,
+                    isUpdatingSubscription = isFetchingSubscription
                 )
 
                 1 -> StrategiesScreen(
@@ -502,6 +641,23 @@ fun MainScreen(
             onDismiss = { showWarpRelayDialog = false }
         )
     }
+
+    if (showSubscriptionDialog) {
+        SubscriptionDialog(
+            initialUrl = subscriptionUrl,
+            onDismiss = {
+                if (!isFetchingSubscription) {
+                    showSubscriptionDialog = false
+                    subscriptionErrorMessage = null
+                }
+            },
+            onFetch = { url ->
+                fetchSubscription(url)
+            },
+            isLoading = isFetchingSubscription,
+            errorMessage = subscriptionErrorMessage
+        )
+    }
 }
 
 @Composable
@@ -509,7 +665,9 @@ private fun AddConfigMenuButton(
     onPasteFromClipboard: () -> Unit,
     onImportFromFile: () -> Unit,
     onGenerateWarp: () -> Unit,
-    onCreateManual: () -> Unit
+    onCreateManual: () -> Unit,
+    onOpenSubscription: () -> Unit,
+    onUpdateSubscription: (() -> Unit)? = null
 ) {
     var expanded by remember { mutableStateOf(false) }
     val rotation by animateFloatAsState(
@@ -540,6 +698,28 @@ private fun AddConfigMenuButton(
                     onPasteFromClipboard()
                 }
             )
+            DropdownMenuItem(
+                text = { Text("Добавить подписку (URL)") },
+                leadingIcon = {
+                    Icon(Icons.Default.CloudDownload, contentDescription = null)
+                },
+                onClick = {
+                    expanded = false
+                    onOpenSubscription()
+                }
+            )
+            if (onUpdateSubscription != null) {
+                DropdownMenuItem(
+                    text = { Text("Обновить подписку") },
+                    leadingIcon = {
+                        Icon(Icons.Default.Sync, contentDescription = null)
+                    },
+                    onClick = {
+                        expanded = false
+                        onUpdateSubscription()
+                    }
+                )
+            }
             DropdownMenuItem(
                 text = { Text("Импорт из файла") },
                 leadingIcon = {

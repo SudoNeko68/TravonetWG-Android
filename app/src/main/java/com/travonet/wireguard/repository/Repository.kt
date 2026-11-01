@@ -5,6 +5,7 @@ import android.content.SharedPreferences
 import com.travonet.wireguard.BuildConfig
 import com.travonet.wireguard.model.DefaultStrategies
 import com.travonet.wireguard.model.EvasionStrategy
+import com.travonet.wireguard.model.Subscription
 import com.travonet.wireguard.model.TunnelMode
 import com.travonet.wireguard.model.WarpRelayMode
 import com.travonet.wireguard.model.WgProfile
@@ -85,6 +86,21 @@ class AppRepository(context: Context) {
         } else {
             current.add(profile)
         }
+        saveProfiles(current)
+    }
+
+    fun replaceSubscriptionProfiles(subUrl: String, newProfiles: List<WgProfile>) {
+        val current = getProfiles().toMutableList()
+        val newIds = newProfiles.map { it.id }.toSet()
+
+        // Cleanly replace old profiles belonging to this subscription or with matching IDs/endpoints
+        current.removeAll { p ->
+            p.subscriptionUrl == subUrl ||
+            p.id in newIds ||
+            newProfiles.any { np -> np.name == p.name && np.endpoint == p.endpoint }
+        }
+
+        current.addAll(newProfiles)
         saveProfiles(current)
     }
 
@@ -313,5 +329,114 @@ class AppRepository(context: Context) {
 
     fun setShowAddressesEnabled(enabled: Boolean) {
         prefs.edit().putBoolean("show_addresses_enabled", enabled).apply()
+    }
+
+    // Subscription Settings (Multi-subscription support & legacy compatibility)
+    fun getSubscriptions(): List<Subscription> {
+        val raw = prefs.getString("subscriptions_list", null)
+        val list = mutableListOf<Subscription>()
+        if (!raw.isNullOrBlank()) {
+            try {
+                val arr = JSONArray(raw)
+                for (i in 0 until arr.length()) {
+                    list.add(Subscription.fromJson(arr.getJSONObject(i)))
+                }
+            } catch (_: Exception) {}
+        }
+
+        // Migrate legacy single subscription if not yet in the list
+        val legacyUrl = prefs.getString("subscription_url", null)?.takeIf { it.isNotBlank() }
+        if (legacyUrl != null && list.none { it.url == legacyUrl }) {
+            val title = prefs.getString("subscription_title", "Подписка") ?: "Подписка"
+            val lastUpdate = prefs.getLong("subscription_last_update", 0L)
+            val sub = Subscription(url = legacyUrl, title = title, lastUpdate = lastUpdate)
+            list.add(0, sub)
+            saveSubscriptions(list)
+        }
+
+        // Auto-discover any subscriptions referenced by loaded profiles
+        val profileSubUrls = getProfiles().mapNotNull { it.subscriptionUrl }.distinct()
+        var addedAny = false
+        for (u in profileSubUrls) {
+            if (list.none { it.url == u }) {
+                list.add(Subscription(url = u, title = "Подписка"))
+                addedAny = true
+            }
+        }
+        if (addedAny) {
+            saveSubscriptions(list)
+        }
+
+        return list
+    }
+
+    fun saveSubscriptions(subs: List<Subscription>) {
+        val arr = JSONArray()
+        subs.forEach { arr.put(it.toJson()) }
+        prefs.edit().putString("subscriptions_list", arr.toString()).apply()
+    }
+
+    fun addOrUpdateSubscription(sub: Subscription) {
+        val current = getSubscriptions().toMutableList()
+        val index = current.indexOfFirst { it.url == sub.url }
+        if (index >= 0) {
+            current[index] = sub
+        } else {
+            current.add(sub)
+        }
+        saveSubscriptions(current)
+        setSubscriptionUrl(sub.url)
+        setSubscriptionTitle(sub.title)
+        setLastSubscriptionUpdate(sub.lastUpdate)
+    }
+
+    fun deleteSubscription(url: String) {
+        // 1. Remove subscription from list
+        val current = getSubscriptions().toMutableList()
+        current.removeAll { it.url == url }
+        saveSubscriptions(current)
+
+        if (getSubscriptionUrl() == url) {
+            val next = current.firstOrNull()
+            setSubscriptionUrl(next?.url)
+            setSubscriptionTitle(next?.title)
+            setLastSubscriptionUpdate(next?.lastUpdate ?: 0L)
+        }
+
+        // 2. Remove all profiles belonging to this subscription
+        val currentProfiles = getProfiles().toMutableList()
+        val toRemove = currentProfiles.filter { it.subscriptionUrl == url }
+        currentProfiles.removeAll { it.subscriptionUrl == url }
+        saveProfiles(currentProfiles)
+
+        // 3. Update selected profile if the deleted one was selected
+        val selectedId = getSelectedProfileId()
+        if (toRemove.any { it.id == selectedId }) {
+            setSelectedProfileId(currentProfiles.firstOrNull()?.id)
+        }
+    }
+
+    fun getSubscriptionUrl(): String? {
+        return prefs.getString("subscription_url", null)?.takeIf { it.isNotBlank() }
+    }
+
+    fun setSubscriptionUrl(url: String?) {
+        prefs.edit().putString("subscription_url", url?.trim()).apply()
+    }
+
+    fun getSubscriptionTitle(): String? {
+        return prefs.getString("subscription_title", null)?.takeIf { it.isNotBlank() }
+    }
+
+    fun setSubscriptionTitle(title: String?) {
+        prefs.edit().putString("subscription_title", title?.trim()).apply()
+    }
+
+    fun getLastSubscriptionUpdate(): Long {
+        return prefs.getLong("subscription_last_update", 0L)
+    }
+
+    fun setLastSubscriptionUpdate(timestamp: Long) {
+        prefs.edit().putLong("subscription_last_update", timestamp).apply()
     }
 }

@@ -9,6 +9,7 @@ import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Cloud
+import androidx.compose.material.icons.filled.CloudDownload
 import androidx.compose.material.icons.filled.ContentPaste
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -131,10 +132,19 @@ fun AddEditProfileDialog(
             Button(
                 onClick = {
                     val trimmed = rawConfig.trim()
-                    if (trimmed.startsWith("vpn://", ignoreCase = true)) {
+                    val httpRegex = Regex("""https?://[^\s"'<>]+""", RegexOption.IGNORE_CASE)
+                    val vpnRegex = Regex("""vpn://[^\s"'<>]+""", RegexOption.IGNORE_CASE)
+
+                    if (httpRegex.containsMatchIn(trimmed) && !trimmed.contains("[Interface]", ignoreCase = true)) {
+                        errorMessage = "Это ссылка на подписку. Используйте кнопку «Добавить подписку» в меню или вставьте её из буфера обмена на главном экране."
+                        return@Button
+                    }
+
+                    val vpnMatch = vpnRegex.find(trimmed)
+                    if (vpnMatch != null && !trimmed.contains("[Interface]", ignoreCase = true)) {
                         val parsedProfile = WgConfigParser.parseProfile(
                             name = name.trim().ifBlank { "Amnezia Profile" },
-                            rawConfig = trimmed,
+                            rawConfig = vpnMatch.value.trim().trimEnd('.', ',', ';'),
                             id = profile?.id
                         )
                         if (!parsedProfile.rawConfig.contains("[Interface]", ignoreCase = true)) {
@@ -275,3 +285,127 @@ fun SocksSettingsDialog(
         }
     )
 }
+
+@Composable
+fun SubscriptionDialog(
+    initialUrl: String = "",
+    onDismiss: () -> Unit,
+    onFetch: (url: String) -> Unit,
+    isLoading: Boolean = false,
+    errorMessage: String? = null
+) {
+    val context = LocalContext.current
+    var urlText by remember { mutableStateOf(initialUrl) }
+    var localError by remember { mutableStateOf<String?>(null) }
+
+    AlertDialog(
+        onDismissRequest = { if (!isLoading) onDismiss() },
+        title = {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Icon(
+                    Icons.Default.CloudDownload,
+                    contentDescription = null,
+                    tint = MaterialTheme.colorScheme.primary
+                )
+                Spacer(Modifier.width(8.dp))
+                Text("Подписка", style = MaterialTheme.typography.titleMedium)
+            }
+        },
+        text = {
+            Column(
+                modifier = Modifier.fillMaxWidth(),
+                verticalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                Text(
+                    text = "Введите ссылку на подписку (URL). Конфигурации AmneziaWG / WireGuard будут импортированы автоматически.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+
+                OutlinedTextField(
+                    value = urlText,
+                    onValueChange = {
+                        urlText = it
+                        localError = null
+                    },
+                    label = { Text("URL подписки (https://...)") },
+                    singleLine = false,
+                    maxLines = 3,
+                    modifier = Modifier.fillMaxWidth(),
+                    enabled = !isLoading,
+                    isError = (localError != null || errorMessage != null)
+                )
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    OutlinedButton(
+                        onClick = {
+                            val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                            val clip = cm.primaryClip
+                            if (clip != null && clip.itemCount > 0) {
+                                val pasteText = clip.getItemAt(0).text?.toString() ?: ""
+                                if (pasteText.isNotBlank()) {
+                                    urlText = pasteText.trim()
+                                    Toast.makeText(context, "Вставлено из буфера", Toast.LENGTH_SHORT).show()
+                                }
+                            }
+                        },
+                        enabled = !isLoading,
+                        modifier = Modifier.weight(1f)
+                    ) {
+                        Icon(Icons.Default.ContentPaste, contentDescription = null, modifier = Modifier.size(16.dp))
+                        Spacer(Modifier.width(6.dp))
+                        Text("Из буфера", fontSize = 12.sp)
+                    }
+                }
+
+                val effectiveError = localError ?: errorMessage
+                if (effectiveError != null) {
+                    Text(
+                        text = effectiveError,
+                        color = MaterialTheme.colorScheme.error,
+                        style = MaterialTheme.typography.bodySmall
+                    )
+                }
+
+                if (isLoading) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
+                        horizontalArrangement = Arrangement.Center,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        CircularProgressIndicator(modifier = Modifier.size(24.dp), strokeWidth = 2.dp)
+                        Spacer(Modifier.width(12.dp))
+                        Text("Загрузка и парсинг...", style = MaterialTheme.typography.bodySmall)
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            Button(
+                onClick = {
+                    val trimmed = urlText.trim()
+                    if (trimmed.isEmpty() || (!trimmed.startsWith("http://", ignoreCase = true) && !trimmed.startsWith("https://", ignoreCase = true))) {
+                        localError = "URL должен начинаться с https:// или http://"
+                        return@Button
+                    }
+                    onFetch(trimmed)
+                },
+                enabled = !isLoading
+            ) {
+                Text("Загрузить")
+            }
+        },
+        dismissButton = {
+            TextButton(
+                onClick = onDismiss,
+                enabled = !isLoading
+            ) {
+                Text("Отмена")
+            }
+        }
+    )
+}
+
