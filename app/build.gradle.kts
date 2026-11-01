@@ -62,13 +62,12 @@ android {
     buildTypes {
         release {
             signingConfig = signingConfigs.getByName("debug")
-            // Keep the release build byte-for-byte close to the debug build.
-            // AGP 9's package-scoped optimizer currently breaks Kotlin
-            // collection internals (IllegalAccessError at app startup), so we
-            // ship an unminified but fully functional release APK.
-            optimization {
-                enable = false
-            }
+            isMinifyEnabled = true
+            isShrinkResources = true
+            proguardFiles(
+                getDefaultProguardFile("proguard-android-optimize.txt"),
+                "proguard-rules.pro"
+            )
         }
     }
     compileOptions {
