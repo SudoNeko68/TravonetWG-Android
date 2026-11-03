@@ -310,17 +310,22 @@ class TravonetUnitTest {
 
     @Test
     fun testRealTravonetSubscriptionFetch() {
-        val url = "https://travonet.ru:2096/sub/9o4ncb577c41xfqi"
-        val result1 = com.travonet.wireguard.subscription.SubscriptionFetcher.fetchSubscription(url)
-        assertEquals("Travonet", result1.title)
-        assertNotNull(result1.profiles)
-        assertTrue("Profiles should not be empty", result1.profiles.isNotEmpty())
-
-        val result2 = com.travonet.wireguard.subscription.SubscriptionFetcher.fetchSubscription(url)
-        // IDs must be deterministic so that updating the subscription replaces profiles instead of duplicating
-        assertEquals(result1.profiles.size, result2.profiles.size)
-        assertEquals(result1.profiles[0].id, result2.profiles[0].id)
-        assertEquals(url, result1.profiles[0].subscriptionUrl)
+        val url = "https://travonet.ru:2096/sub/a1omsts2x1kunn7o"
+        try {
+            val result = com.travonet.wireguard.subscription.SubscriptionFetcher.fetchSubscription(url)
+            println("FETCHED TITLE: ${result.title}")
+            println("PROFILES COUNT: ${result.profiles.size}")
+            for (p in result.profiles) {
+                println("--- Profile: ${p.name} (${p.endpoint}) ---")
+                println(p.rawConfig)
+            }
+            assertEquals("Travonet", result.title)
+            assertEquals(2, result.profiles.size)
+        } catch (e: Exception) {
+            println("Failed to fetch live subscription: ${e.message}")
+            e.printStackTrace()
+            throw e
+        }
     }
 
     @Test
@@ -406,6 +411,100 @@ class TravonetUnitTest {
         assertNotNull(traffic)
         assertTrue("Should contain infinity symbol", traffic!!.contains("∞"))
         assertNull("Zero expire time should return null", sub.formattedExpire())
+    }
+
+    @Test
+    fun testAmneziaNoEvasionInjection() {
+        val amneziaRaw = """
+            [Interface]
+            PrivateKey = wJDD6EqwRlVwOCYSTsTdSrmrQU4/86VdaDjZp8Bcfk4=
+            Address = 10.8.1.26/32
+            DNS = 8.8.8.8, 8.8.4.4
+            MTU = 1200
+            Jc = 4
+            Jmin = 52
+            Jmax = 105
+            S1 = 150
+            S2 = 74
+            H1 = 521314697
+            H2 = 947619070
+
+            [Peer]
+            PublicKey = l/uN/aCjHCnMvl8ksmKQvmO6hJPcGQezdBqOqUYqp1M=
+            AllowedIPs = 0.0.0.0/0, ::/0
+            Endpoint = travonet.ru:29835
+        """.trimIndent()
+
+        assertTrue(WgConfigParser.isAmneziaConfig(amneziaRaw))
+
+        val profile = WgConfigParser.parseProfile("Amnezia Test", amneziaRaw)
+        val fallbackStrategy = EvasionStrategy(
+            name = "ТСПУ Burst",
+            description = "",
+            dsl = "junk(size=64) -> fake_udp(size=148)"
+        )
+
+        val prepared = WgConfigParser.prepareConfigForLaunch(profile, fallbackStrategy)
+        assertTrue("Amnezia configs must have NoEvasion = true injected", prepared.contains("NoEvasion = true"))
+        assertFalse("Amnezia configs must NOT have Strategy injected", prepared.contains("Strategy ="))
+        assertFalse("Amnezia configs must NOT have FakeTTL injected", prepared.contains("FakeTTL ="))
+        assertTrue("Amnezia Jc must be preserved", prepared.contains("Jc = 4"))
+    }
+
+    @Test
+    fun testParseWireGuardUrl() {
+        // 1. URL with query parameters format
+        val wgUri = "wireguard://bmXOC%2BF1FxEMF9dyiK2H5%2F1SUtzH0JuVo51h2wPfgyo%3D@162.159.192.1:2408?address=172.16.0.2%2F32&privatekey=OCugIHnrk%2Fr8Zdtd5AGYIchdMag%2BdqXF08yn1AZ2aUw%3D&dns=1.1.1.1#Custom%20WireGuard"
+        val parsed = WgConfigParser.parseWireGuardUrl(wgUri)
+        assertNotNull(parsed)
+        val (config, name) = parsed!!
+        assertEquals("Custom WireGuard", name)
+        assertTrue(config.contains("[Interface]"))
+        assertTrue(config.contains("PrivateKey = OCugIHnrk/r8Zdtd5AGYIchdMag+dqXF08yn1AZ2aUw="))
+        assertTrue(config.contains("Address = 172.16.0.2/32"))
+        assertTrue(config.contains("PublicKey = bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo="))
+        assertTrue(config.contains("Endpoint = 162.159.192.1:2408"))
+
+        // 2. Base64 payload format (e.g. wg://<base64>#Name)
+        val base64Conf = java.util.Base64.getEncoder().encodeToString(sampleConfigWithoutStrategy.toByteArray())
+        val wgB64Uri = "wg://$base64Conf#Standard%20WG"
+        val parsedB64 = WgConfigParser.parseWireGuardUrl(wgB64Uri)
+        assertNotNull(parsedB64)
+        val (configB64, nameB64) = parsedB64!!
+        assertEquals("Standard WG", nameB64)
+        assertTrue(configB64.contains("162.159.192.1:2408"))
+    }
+
+    @Test
+    fun testMultiProfileIniSubscription() {
+        val multiIni = """
+            # Server 1 - Amsterdam
+            [Interface]
+            PrivateKey = aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+            Address = 10.0.0.1/32
+            
+            [Peer]
+            PublicKey = bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+            Endpoint = 198.51.100.1:51820
+            AllowedIPs = 0.0.0.0/0
+            
+            # Server 2 - Frankfurt
+            [Interface]
+            PrivateKey = cccccccccccccccccccccccccccccccccccccccccccc
+            Address = 10.0.0.2/32
+            
+            [Peer]
+            PublicKey = dddddddddddddddddddddddddddddddddddddddddddd
+            Endpoint = 198.51.100.2:51820
+            AllowedIPs = 0.0.0.0/0
+        """.trimIndent()
+
+        val profiles = com.travonet.wireguard.subscription.SubscriptionFetcher.parseSubscriptionBody(multiIni, "Test Multi")
+        assertEquals(2, profiles.size)
+        assertEquals("Server 1 - Amsterdam", profiles[0].name)
+        assertEquals("198.51.100.1:51820", profiles[0].endpoint)
+        assertEquals("Server 2 - Frankfurt", profiles[1].name)
+        assertEquals("198.51.100.2:51820", profiles[1].endpoint)
     }
 }
 

@@ -198,10 +198,12 @@ fun MainScreen(
 
             val httpRegex = Regex("""https?://[^\s"'<>]+""", RegexOption.IGNORE_CASE)
             val vpnRegex = Regex("""vpn://[^\s"'<>]+""", RegexOption.IGNORE_CASE)
+            val wgRegex = Regex("""(wireguard|wg)://[^\s"'<>]+""", RegexOption.IGNORE_CASE)
             val interfaceRegex = Regex("""\[Interface\]""", RegexOption.IGNORE_CASE)
 
             val httpMatch = httpRegex.find(text)
             val vpnMatch = vpnRegex.find(text)
+            val wgMatch = wgRegex.find(text)
             val hasInterface = interfaceRegex.containsMatchIn(text)
 
             when {
@@ -227,6 +229,21 @@ fun MainScreen(
                         Toast.makeText(context, "Не удалось разобрать ссылку vpn://", Toast.LENGTH_SHORT).show()
                     }
                 }
+                // WireGuard wireguard:// or wg:// URL
+                wgMatch != null && !hasInterface -> {
+                    val wgUrl = wgMatch.value.trim().trimEnd('.', ',', ';')
+                    val profile = WgConfigParser.parseProfile("Профиль из буфера", wgUrl)
+                    if (profile.rawConfig.contains("[Interface]", ignoreCase = true)) {
+                        repository.addOrUpdateProfile(profile)
+                        profiles = repository.getProfiles()
+                        selectedProfileId = profile.id
+                        repository.setSelectedProfileId(profile.id)
+                        scope.launch { pagerState.animateScrollToPage(0) }
+                        Toast.makeText(context, "Импортировано: ${profile.name}", Toast.LENGTH_SHORT).show()
+                    } else {
+                        Toast.makeText(context, "Не удалось разобрать ссылку WireGuard", Toast.LENGTH_SHORT).show()
+                    }
+                }
                 // WireGuard / AmneziaWG .conf configuration
                 hasInterface -> {
                     val profile = WgConfigParser.parseProfile("Профиль из буфера", text)
@@ -240,7 +257,7 @@ fun MainScreen(
                 else -> {
                     Toast.makeText(
                         context,
-                        "Буфер не содержит конфигурацию ([Interface]), ссылку vpn:// или URL подписки",
+                        "Буфер не содержит конфигурацию ([Interface]), ссылку (vpn://, wireguard://) или URL подписки",
                         Toast.LENGTH_LONG
                     ).show()
                 }
@@ -473,6 +490,13 @@ fun MainScreen(
                     onSelectProfile = { id ->
                         selectedProfileId = id
                         repository.setSelectedProfileId(id)
+                        val curState = TunnelManager.state.value
+                        if (curState.status == com.travonet.wireguard.model.TunnelStatus.CONNECTED && curState.profileId != id) {
+                            val newProf = profiles.firstOrNull { it.id == id }
+                            if (newProf != null) {
+                                onRequestStartTunnel(newProf, activeFallbackStrategy, tunnelMode)
+                            }
+                        }
                     },
                     onAddOrUpdateProfile = { newProf ->
                         repository.addOrUpdateProfile(newProf)

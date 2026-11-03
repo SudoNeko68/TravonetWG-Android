@@ -28,8 +28,10 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.travonet.wireguard.model.EvasionStrategy
 import com.travonet.wireguard.model.Subscription
+import com.travonet.wireguard.model.TunnelStatus
 import com.travonet.wireguard.model.WgProfile
 import com.travonet.wireguard.service.PingResult
+import com.travonet.wireguard.service.TunnelManager
 import com.travonet.wireguard.ui.dialogs.AddEditProfileDialog
 import com.travonet.wireguard.ui.dialogs.DeleteConfirmDialog
 
@@ -62,6 +64,8 @@ fun ConfigsScreen(
     modifier: Modifier = Modifier
 ) {
     val context = LocalContext.current
+    val tunnelState by TunnelManager.state.collectAsState()
+    val connectedProfileId = if (tunnelState.status == TunnelStatus.CONNECTED) tunnelState.profileId else null
     var editingProfile by remember { mutableStateOf<WgProfile?>(null) }
     var deletingProfileId by remember { mutableStateOf<String?>(null) }
     var deletingSubscription by remember { mutableStateOf<Subscription?>(null) }
@@ -292,6 +296,7 @@ fun ConfigsScreen(
                                 ProfileItemRow(
                                     profile = profile,
                                     isSelected = profile.id == selectedProfileId,
+                                    isConnected = profile.id == connectedProfileId,
                                     showAddresses = showAddresses,
                                     fallbackStrategy = fallbackStrategy,
                                     pingResult = pingResults[profile.id],
@@ -375,6 +380,7 @@ fun ConfigsScreen(
                                 ProfileItemRow(
                                     profile = profile,
                                     isSelected = profile.id == selectedProfileId,
+                                    isConnected = profile.id == connectedProfileId,
                                     showAddresses = showAddresses,
                                     fallbackStrategy = fallbackStrategy,
                                     pingResult = pingResults[profile.id],
@@ -755,6 +761,7 @@ private fun SubscriptionGroupCard(
 private fun ProfileItemRow(
     profile: WgProfile,
     isSelected: Boolean,
+    isConnected: Boolean = false,
     showAddresses: Boolean,
     fallbackStrategy: EvasionStrategy,
     pingResult: PingResult?,
@@ -765,7 +772,9 @@ private fun ProfileItemRow(
 ) {
     var showItemMenu by remember { mutableStateOf(false) }
 
-    val rowBgColor = if (isSelected) {
+    val rowBgColor = if (isConnected) {
+        Color(0xFF2E7D32).copy(alpha = 0.12f)
+    } else if (isSelected) {
         MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.25f)
     } else {
         Color.Transparent
@@ -781,7 +790,9 @@ private fun ProfileItemRow(
         // Leading globe icon in a circular container (matches Happ design)
         Surface(
             shape = CircleShape,
-            color = if (isSelected) {
+            color = if (isConnected) {
+                Color(0xFF2E7D32).copy(alpha = 0.18f)
+            } else if (isSelected) {
                 MaterialTheme.colorScheme.primary.copy(alpha = 0.15f)
             } else {
                 MaterialTheme.colorScheme.surfaceVariant
@@ -793,7 +804,13 @@ private fun ProfileItemRow(
                     imageVector = Icons.Default.Public,
                     contentDescription = null,
                     modifier = Modifier.size(20.dp),
-                    tint = if (isSelected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant
+                    tint = if (isConnected) {
+                        Color(0xFF2E7D32)
+                    } else if (isSelected) {
+                        MaterialTheme.colorScheme.primary
+                    } else {
+                        MaterialTheme.colorScheme.onSurfaceVariant
+                    }
                 )
             }
         }
@@ -815,16 +832,28 @@ private fun ProfileItemRow(
                     modifier = Modifier.weight(1f, fill = false)
                 )
 
-                if (isSelected) {
+                if (isConnected) {
+                    Badge(
+                        containerColor = Color(0xFF2E7D32),
+                        contentColor = Color.White
+                    ) {
+                        Text(
+                            "ПОДКЛЮЧЕНО",
+                            fontSize = 9.sp,
+                            fontWeight = FontWeight.Bold,
+                            modifier = Modifier.padding(horizontal = 4.dp)
+                        )
+                    }
+                } else if (isSelected) {
                     Badge(
                         containerColor = MaterialTheme.colorScheme.primary,
                         contentColor = MaterialTheme.colorScheme.onPrimary
                     ) {
                         Text(
-                            "АКТИВЕН",
+                            "ВЫБРАН",
                             fontSize = 9.sp,
                             fontWeight = FontWeight.Bold,
-                            modifier = Modifier.padding(horizontal = 3.dp)
+                            modifier = Modifier.padding(horizontal = 4.dp)
                         )
                     }
                 }

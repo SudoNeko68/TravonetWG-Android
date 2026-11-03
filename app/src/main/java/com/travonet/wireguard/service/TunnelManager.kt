@@ -30,11 +30,19 @@ object TunnelManager {
     var vpnHandle: Int = -1
     var socksHandle: Int = -1
 
-    fun updateState(status: TunnelStatus, message: String = "", profileName: String = "", mode: TunnelMode = TunnelMode.VPN, strategyName: String = "") {
+    fun updateState(
+        status: TunnelStatus,
+        message: String = "",
+        profileName: String = "",
+        profileId: String? = null,
+        mode: TunnelMode = TunnelMode.VPN,
+        strategyName: String = ""
+    ) {
         _state.value = TunnelState(
             status = status,
             message = message,
             profileName = if (profileName.isNotEmpty()) profileName else _state.value.profileName,
+            profileId = if (status == TunnelStatus.DISCONNECTED) null else (profileId ?: _state.value.profileId),
             mode = mode,
             strategyName = if (strategyName.isNotEmpty()) strategyName else _state.value.strategyName
         )
@@ -49,10 +57,27 @@ object TunnelManager {
     }
 
     fun start(context: Context, profile: WgProfile, fallbackStrategy: EvasionStrategy, mode: TunnelMode) {
-        if (_state.value.status == TunnelStatus.CONNECTED || _state.value.status == TunnelStatus.CONNECTING) {
+        if (_state.value.status == TunnelStatus.CONNECTING || _state.value.status == TunnelStatus.STOPPING) {
             return
         }
 
+        if (_state.value.status == TunnelStatus.CONNECTED) {
+            if (_state.value.profileId == profile.id && _state.value.mode == mode) {
+                return
+            }
+            // Seamless switch to another profile or mode: cleanly stop current tunnel first
+            stop(context)
+            CoroutineScope(Dispatchers.Main).launch {
+                delay(350)
+                startInternal(context, profile, fallbackStrategy, mode)
+            }
+            return
+        }
+
+        startInternal(context, profile, fallbackStrategy, mode)
+    }
+
+    private fun startInternal(context: Context, profile: WgProfile, fallbackStrategy: EvasionStrategy, mode: TunnelMode) {
         val strategyNameToReport = if (profile.hasEmbeddedStrategy) {
             "Из конфига: ${profile.embeddedStrategy}"
         } else {
@@ -62,6 +87,7 @@ object TunnelManager {
         updateState(
             status = TunnelStatus.CONNECTING,
             profileName = profile.name,
+            profileId = profile.id,
             mode = mode,
             strategyName = strategyNameToReport
         )

@@ -115,6 +115,7 @@ class TravonetSocksService : Service() {
                 TunnelManager.updateState(
                     status = TunnelStatus.CONNECTED,
                     profileName = profile.name,
+                    profileId = profile.id,
                     mode = TunnelMode.SOCKS5,
                     strategyName = activeStrategyDesc
                 )

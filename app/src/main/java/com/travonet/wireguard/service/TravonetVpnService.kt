@@ -260,6 +260,7 @@ class TravonetVpnService : VpnService() {
             TunnelManager.updateState(
                 status = TunnelStatus.CONNECTED,
                 profileName = profile.name,
+                profileId = profile.id,
                 mode = TunnelMode.VPN,
                 strategyName = activeStrategyDesc
             )

@@ -31,6 +31,7 @@ data class TunnelState(
     val status: TunnelStatus = TunnelStatus.DISCONNECTED,
     val message: String = "",
     val profileName: String = "",
+    val profileId: String? = null,
     val mode: TunnelMode = TunnelMode.VPN,
     val strategyName: String = ""
 )

@@ -79,86 +79,179 @@ object SubscriptionFetcher {
         val trimmed = body.trim()
         if (trimmed.isEmpty()) return emptyList()
 
-        // Standard subscriptions return a Base64-encoded string containing links or raw configs
+        // 1. Decode outer Base64 if present
         var textToParse = trimmed
         val decodedBytes = decodeBase64(trimmed)
         if (decodedBytes != null) {
             val decodedString = String(decodedBytes, StandardCharsets.UTF_8).trim()
-            if (decodedString.contains("://") || decodedString.contains("[Interface]") || decodedString.contains("\n")) {
+            if (decodedString.contains("://") || decodedString.contains("[Interface]", ignoreCase = true) || decodedString.contains("\n")) {
                 textToParse = decodedString
             }
         }
 
+
         val profiles = mutableListOf<WgProfile>()
         var counter = 1
 
-        val lines = textToParse.lines()
-        val linkLines = lines.map { it.trim() }.filter { it.isNotBlank() && !it.startsWith("#") && !it.startsWith("//") }
-
-        // If the whole decoded body is a single [Interface] config
-        val isSingleIni = textToParse.contains("[Interface]", ignoreCase = true) && !textToParse.contains("vpn://")
-
-        if (isSingleIni) {
-            val name = defaultTitle ?: "Подписка"
-            val profileId = if (!subscriptionUrl.isNullOrBlank()) {
-                java.util.UUID.nameUUIDFromBytes("sub:${subscriptionUrl}_1".toByteArray()).toString()
-            } else {
-                java.util.UUID.randomUUID().toString()
-            }
-            profiles.add(
-                WgConfigParser.parseProfile(
-                    name = name,
-                    rawConfig = textToParse,
-                    id = profileId,
-                    subscriptionUrl = subscriptionUrl
-                )
-            )
-            return profiles
-        }
-
-        for (line in linkLines) {
-            val profileId = if (!subscriptionUrl.isNullOrBlank()) {
+        fun makeProfileId(): String {
+            return if (!subscriptionUrl.isNullOrBlank()) {
                 java.util.UUID.nameUUIDFromBytes("sub:${subscriptionUrl}_$counter".toByteArray()).toString()
             } else {
                 java.util.UUID.randomUUID().toString()
             }
+        }
 
-            if (line.startsWith("vpn://", ignoreCase = true)) {
-                val fallbackName = if (defaultTitle != null && linkLines.size > 1) {
+        // 2. Check if textToParse is multi-config INI containing one or more [Interface] sections
+        val hasUrlSchemes = textToParse.contains("vpn://", ignoreCase = true) ||
+                textToParse.contains("wireguard://", ignoreCase = true) ||
+                textToParse.contains("wg://", ignoreCase = true)
+
+        if (!hasUrlSchemes && textToParse.contains("[Interface]", ignoreCase = true)) {
+            val blocks = splitIniConfigs(textToParse)
+            for (block in blocks) {
+                val fallbackName = if (defaultTitle != null && blocks.size > 1) {
                     "$defaultTitle $counter"
                 } else {
                     defaultTitle ?: "Профиль $counter"
                 }
+                val blockName = extractNameFromIniBlock(block) ?: fallbackName
                 val profile = WgConfigParser.parseProfile(
-                    name = fallbackName,
-                    rawConfig = line,
-                    id = profileId,
+                    name = blockName,
+                    rawConfig = block,
+                    id = makeProfileId(),
                     subscriptionUrl = subscriptionUrl
                 )
                 if (profile.rawConfig.contains("[Interface]", ignoreCase = true)) {
                     profiles.add(profile)
                     counter++
                 }
-            } else if (line.startsWith("[Interface]", ignoreCase = true)) {
-                val fallbackName = if (defaultTitle != null && linkLines.size > 1) {
-                    "$defaultTitle $counter"
-                } else {
-                    defaultTitle ?: "Профиль $counter"
-                }
+            }
+            if (profiles.isNotEmpty()) return profiles
+        }
+
+        // 3. Otherwise, parse line by line (URLs, Base64 chunks, individual configs)
+        val lines = textToParse.lines().map { it.trim() }.filter { it.isNotBlank() && !it.startsWith("#") && !it.startsWith("//") }
+        for (line in lines) {
+            val fallbackName = if (defaultTitle != null && lines.size > 1) {
+                "$defaultTitle $counter"
+            } else {
+                defaultTitle ?: "Профиль $counter"
+            }
+
+            if (line.startsWith("vpn://", ignoreCase = true) ||
+                line.startsWith("wireguard://", ignoreCase = true) ||
+                line.startsWith("wg://", ignoreCase = true)
+            ) {
                 val profile = WgConfigParser.parseProfile(
                     name = fallbackName,
                     rawConfig = line,
-                    id = profileId,
+                    id = makeProfileId(),
                     subscriptionUrl = subscriptionUrl
                 )
                 if (profile.rawConfig.contains("[Interface]", ignoreCase = true)) {
                     profiles.add(profile)
                     counter++
+                }
+            } else {
+                val decodedLine = tryDecodeBase64(line)
+                if (decodedLine != null && decodedLine.contains("[Interface]", ignoreCase = true)) {
+                    val blocks = splitIniConfigs(decodedLine)
+                    for (block in blocks) {
+                        val fallbackBlockName = if (defaultTitle != null && blocks.size > 1) {
+                            "$defaultTitle $counter"
+                        } else {
+                            fallbackName
+                        }
+                        val blockName = extractNameFromIniBlock(block) ?: fallbackBlockName
+                        val profile = WgConfigParser.parseProfile(
+                            name = blockName,
+                            rawConfig = block,
+                            id = makeProfileId(),
+                            subscriptionUrl = subscriptionUrl
+                        )
+                        if (profile.rawConfig.contains("[Interface]", ignoreCase = true)) {
+                            profiles.add(profile)
+                            counter++
+                        }
+                    }
                 }
             }
         }
 
         return profiles
+    }
+
+    private fun splitIniConfigs(text: String): List<String> {
+        val lines = text.lines()
+        val blocks = mutableListOf<String>()
+        val currentBlock = StringBuilder()
+        val pendingLeadingLines = mutableListOf<String>()
+        var hasSeenInterfaceInCurrent = false
+
+        for (line in lines) {
+            val trimmed = line.trim()
+            if (trimmed.equals("[Interface]", ignoreCase = true)) {
+                if (hasSeenInterfaceInCurrent) {
+                    blocks.add(currentBlock.toString().trim())
+                    currentBlock.clear()
+                }
+                for (pending in pendingLeadingLines) {
+                    currentBlock.appendLine(pending)
+                }
+                pendingLeadingLines.clear()
+                hasSeenInterfaceInCurrent = true
+                currentBlock.appendLine(line)
+            } else if (!hasSeenInterfaceInCurrent) {
+                pendingLeadingLines.add(line)
+            } else {
+                if (trimmed.startsWith("#") || trimmed.startsWith(";") || trimmed.isEmpty()) {
+                    pendingLeadingLines.add(line)
+                } else {
+                    for (pending in pendingLeadingLines) {
+                        currentBlock.appendLine(pending)
+                    }
+                    pendingLeadingLines.clear()
+                    currentBlock.appendLine(line)
+                }
+            }
+        }
+        for (pending in pendingLeadingLines) {
+            currentBlock.appendLine(pending)
+        }
+        if (currentBlock.isNotBlank() && hasSeenInterfaceInCurrent) {
+            blocks.add(currentBlock.toString().trim())
+        }
+        return if (blocks.isNotEmpty()) blocks else listOf(text.trim())
+    }
+
+    private fun extractNameFromIniBlock(block: String): String? {
+        val lines = block.lines()
+        for (line in lines) {
+            val trimmed = line.trim()
+            if (trimmed.startsWith("#") && !trimmed.startsWith("# Injected")) {
+                val comment = trimmed.substring(1).trim()
+                if (comment.isNotBlank() && !comment.startsWith("---") && !comment.contains("=")) {
+                    return comment
+                }
+            }
+            if (trimmed.equals("[Interface]", ignoreCase = true)) {
+                break
+            }
+        }
+        return null
+    }
+
+    private fun tryDecodeBase64(input: String): String? {
+        val sanitized = input.replace("\r", "").replace("\n", "").replace(" ", "").trim()
+        if (sanitized.isEmpty()) return null
+        return try {
+            val bytes = decodeBase64(sanitized)
+            if (bytes != null && bytes.isNotEmpty()) {
+                String(bytes, StandardCharsets.UTF_8)
+            } else null
+        } catch (_: Exception) {
+            null
+        }
     }
 
     private fun createInsecureSslContext(): SSLContext {
