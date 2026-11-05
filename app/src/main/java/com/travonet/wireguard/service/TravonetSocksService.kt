@@ -12,10 +12,15 @@ import android.os.Build
 import android.os.IBinder
 import android.util.Log
 import androidx.core.app.NotificationCompat
+import com.freevpn.coreloader.NativeCoreBridge
 import com.travonet.wireguard.MainActivity
 import com.travonet.wireguard.R
+import com.travonet.wireguard.core.CoreManager
+import com.travonet.wireguard.core.CoreRouter
+import com.travonet.wireguard.core.CoreType
 import com.travonet.wireguard.model.TunnelMode
 import com.travonet.wireguard.model.TunnelStatus
+import com.travonet.wireguard.parser.ProxyConfigSynthesizer
 import com.travonet.wireguard.parser.WgConfigParser
 import com.travonet.wireguard.repository.AppRepository
 import kotlinx.coroutines.CoroutineScope
@@ -31,6 +36,7 @@ class TravonetSocksService : Service() {
     private val serviceScope = CoroutineScope(Dispatchers.IO)
     private var startJob: Job? = null
     private var statsJob: Job? = null
+    private var isProxyActive = false
 
     companion object {
         const val TAG = "TravonetSocks"
@@ -39,6 +45,7 @@ class TravonetSocksService : Service() {
         const val EXTRA_PROFILE_ID = "profile_id"
         private const val NOTIFICATION_ID = 1002
         private const val CHANNEL_ID = "travonet_socks_channel"
+        private const val PROXY_SOCKS_HANDLE = 99997
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
@@ -57,17 +64,20 @@ class TravonetSocksService : Service() {
 
         if (action == ACTION_START) {
             val profileId = intent.getStringExtra(EXTRA_PROFILE_ID)
+            Log.i(TAG, "onStartCommand: ACTION_START with profileId=$profileId")
             val repository = AppRepository(this)
             val profile = repository.getProfiles().firstOrNull { it.id == profileId }
                 ?: repository.getSelectedProfile()
 
             if (profile == null) {
+                Log.e(TAG, "Profile not found for id: $profileId")
                 TunnelManager.updateState(TunnelStatus.ERROR, "Профиль не найден")
                 stopSelf()
                 return START_NOT_STICKY
             }
 
             val listenAddr = repository.getSocksListenAddr()
+            Log.i(TAG, "Selected profile: ${profile.name} (id=${profile.id}), listen=$listenAddr")
             // Immediately start foreground notification to satisfy Android Foreground Service watchdog
             startForegroundServiceNotification(profile.name, listenAddr, "Запуск SOCKS5...")
 
@@ -86,52 +96,158 @@ class TravonetSocksService : Service() {
         startJob?.cancel()
         startJob = serviceScope.launch {
             try {
-                if (TunnelManager.socksHandle >= 0) {
+                // Clean up previous tunnel if any
+                if (TunnelManager.socksHandle in 0 until 90000) {
                     try {
                         GoBackend.wgStopSocks5(TunnelManager.socksHandle)
                     } catch (e: Exception) {
-                        Log.e(TAG, "Error stopping previous socks", e)
+                        Log.e(TAG, "Error stopping previous wg socks", e)
                     }
-                    TunnelManager.socksHandle = -1
                 }
-
-                val preparedConfig = WgConfigParser.prepareConfigForLaunch(profile, strategy)
-
-                val handle = GoBackend.wgStartSocks5(listenAddr, preparedConfig)
-                if (handle < 0) {
-                    TunnelManager.updateState(TunnelStatus.ERROR, "Ошибка запуска SOCKS5 прокси (Код: $handle)")
-                    stopSelf()
-                    return@launch
+                if (isProxyActive || NativeCoreBridge.isProxyRunningNative()) {
+                    try {
+                        NativeCoreBridge.stopCoreNative()
+                    } catch (e: Exception) {
+                        Log.e(TAG, "Error stopping previous proxy core", e)
+                    }
+                    isProxyActive = false
                 }
+                TunnelManager.socksHandle = -1
 
-                TunnelManager.socksHandle = handle
+                val delegations = AppRepository(this@TravonetSocksService).getProtocolDelegations()
+                val routing = CoreRouter.route(profile.rawConfig, delegations)
+                Log.i(TAG, "startProxy: profile=${profile.name}, targetCore=${routing.targetCore}, proto=${routing.detectedProtocol}, rawConfigPrefix=${profile.rawConfig.take(30)}")
 
-                val activeStrategyDesc = if (profile.hasEmbeddedStrategy) {
-                    "В конфиге: ${profile.embeddedStrategy}"
+                if (routing.targetCore == CoreType.TRAVONET_WG) {
+                    Log.i(TAG, "Launching via TravonetWG GoBackend")
+                    val preparedConfig = WgConfigParser.prepareConfigForLaunch(profile, strategy)
+                    val handle = GoBackend.wgStartSocks5(listenAddr, preparedConfig)
+                    if (handle < 0) {
+                        TunnelManager.updateState(TunnelStatus.ERROR, "Ошибка запуска SOCKS5 прокси (Код: $handle)")
+                        stopForeground(STOP_FOREGROUND_REMOVE)
+                        stopSelf()
+                        return@launch
+                    }
+
+                    TunnelManager.socksHandle = handle
+
+                    val activeStrategyDesc = if (profile.hasEmbeddedStrategy) {
+                        "В конфиге: ${profile.embeddedStrategy}"
+                    } else {
+                        strategy.name
+                    }
+
+                    TunnelManager.updateState(
+                        status = TunnelStatus.CONNECTED,
+                        profileName = profile.name,
+                        profileId = profile.id,
+                        mode = TunnelMode.SOCKS5,
+                        strategyName = activeStrategyDesc
+                    )
+
+                    startForegroundServiceNotification(profile.name, listenAddr, "Прокси активен на $listenAddr")
+                    startStatsPolling(handle, profile.name, listenAddr)
                 } else {
-                    strategy.name
+                    // Proxy cores: Xray, Sing-Box, FreeTURN
+                    val targetCore = routing.targetCore
+                    if (!CoreManager.isInstalled(this@TravonetSocksService, targetCore)) {
+                        TunnelManager.updateState(
+                            TunnelStatus.ERROR,
+                            "Не установлено ядро ${targetCore.title} для ${routing.detectedProtocol}. Установите его во вкладке «Ядра»."
+                        )
+                        stopForeground(STOP_FOREGROUND_REMOVE)
+                        stopSelf()
+                        return@launch
+                    }
+
+                    val corePath = CoreManager.getCoreFilePath(this@TravonetSocksService, targetCore)
+                    if (corePath == null) {
+                        TunnelManager.updateState(
+                            TunnelStatus.ERROR,
+                            "Файл ядра ${targetCore.title} не найден."
+                        )
+                        stopForeground(STOP_FOREGROUND_REMOVE)
+                        stopSelf()
+                        return@launch
+                    }
+
+                    val configJson = try {
+                        ProxyConfigSynthesizer.synthesize(
+                            profile.rawConfig,
+                            targetCore,
+                            mode = TunnelMode.SOCKS5,
+                            socksListen = listenAddr
+                        )
+                    } catch (e: Exception) {
+                        Log.e(TAG, "Failed to synthesize proxy config for SOCKS5", e)
+                        TunnelManager.updateState(
+                            TunnelStatus.ERROR,
+                            "Ошибка формирования конфигурации: ${e.localizedMessage ?: "Синтаксическая ошибка"}"
+                        )
+                        stopForeground(STOP_FOREGROUND_REMOVE)
+                        stopSelf()
+                        return@launch
+                    }
+
+                    var lastErr = ""
+                    val started = runCatching {
+                        var ok = false
+                        val t = kotlin.concurrent.thread(name = "SocksProxy-Init", start = true) {
+                            // tunFd = -1 signals SOCKS mode without TUN interface
+                            ok = NativeCoreBridge.startProxyWithCore(corePath, configJson, -1)
+                            if (!ok) {
+                                lastErr = NativeCoreBridge.getLastCoreErrorNative()
+                            }
+                        }
+                        t.join()
+                        ok
+                    }.getOrDefault(false)
+
+                    if (!started) {
+                        val displayErr = if (lastErr.isNotBlank()) lastErr else "Не удалось запустить ядро ${targetCore.title}"
+                        Log.e(TAG, "Proxy core failed to start in SOCKS mode: $displayErr")
+                        TunnelManager.updateState(TunnelStatus.ERROR, displayErr)
+                        stopForeground(STOP_FOREGROUND_REMOVE)
+                        stopSelf()
+                        return@launch
+                    }
+
+                    isProxyActive = true
+                    TunnelManager.socksHandle = PROXY_SOCKS_HANDLE
+
+                    val activeStrategyDesc = if (profile.hasEmbeddedStrategy) {
+                        "В конфиге: ${profile.embeddedStrategy}"
+                    } else {
+                        "${targetCore.title} (${routing.detectedProtocol})"
+                    }
+
+                    TunnelManager.updateState(
+                        status = TunnelStatus.CONNECTED,
+                        profileName = profile.name,
+                        profileId = profile.id,
+                        mode = TunnelMode.SOCKS5,
+                        strategyName = activeStrategyDesc
+                    )
+
+                    startForegroundServiceNotification(
+                        profile.name,
+                        listenAddr,
+                        "SOCKS5 активен на $listenAddr (${targetCore.title})"
+                    )
+                    startProxyWatchdog(PROXY_SOCKS_HANDLE, profile.name, listenAddr, targetCore.title)
                 }
-
-                TunnelManager.updateState(
-                    status = TunnelStatus.CONNECTED,
-                    profileName = profile.name,
-                    profileId = profile.id,
-                    mode = TunnelMode.SOCKS5,
-                    strategyName = activeStrategyDesc
-                )
-
-                startForegroundServiceNotification(profile.name, listenAddr, "Прокси активен на $listenAddr")
-                startStatsPolling(handle, profile.name, listenAddr)
 
             } catch (e: kotlinx.coroutines.CancellationException) {
                 Log.i(TAG, "startProxy was cancelled")
                 TunnelManager.socksHandle = -1
+                isProxyActive = false
                 TunnelManager.updateState(TunnelStatus.DISCONNECTED)
                 stopForeground(STOP_FOREGROUND_REMOVE)
                 stopSelf()
             } catch (e: Throwable) {
                 Log.e(TAG, "Error starting socks proxy", e)
                 TunnelManager.socksHandle = -1
+                isProxyActive = false
                 TunnelManager.updateState(TunnelStatus.ERROR, e.localizedMessage ?: "Неизвестная ошибка")
                 stopForeground(STOP_FOREGROUND_REMOVE)
                 stopSelf()
@@ -157,6 +273,38 @@ class TravonetSocksService : Service() {
         }
     }
 
+    private fun startProxyWatchdog(
+        handle: Int,
+        profileName: String,
+        listenAddr: String,
+        coreTitle: String
+    ) {
+        statsJob?.cancel()
+        statsJob = serviceScope.launch {
+            while (isActive && TunnelManager.socksHandle == handle) {
+                delay(2000)
+                if (!NativeCoreBridge.isProxyRunningNative()) {
+                    Log.e(TAG, "Proxy core $coreTitle unexpectedly stopped in SOCKS mode")
+                    TunnelManager.socksHandle = -1
+                    isProxyActive = false
+                    TunnelManager.updateState(TunnelStatus.ERROR, "Ядро $coreTitle аварийно завершило работу")
+                    stopForeground(STOP_FOREGROUND_REMOVE)
+                    stopSelf()
+                    break
+                }
+                val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+                nm.notify(
+                    NOTIFICATION_ID,
+                    buildNotification(
+                        profileName,
+                        listenAddr,
+                        "SOCKS5 ($coreTitle): $listenAddr"
+                    )
+                )
+            }
+        }
+    }
+
     private fun stopProxy() {
         startJob?.cancel()
         startJob = null
@@ -164,13 +312,22 @@ class TravonetSocksService : Service() {
         statsJob = null
 
         val handle = TunnelManager.socksHandle
-        if (handle >= 0) {
+        if (handle in 0 until 90000) {
             try {
                 GoBackend.wgStopSocks5(handle)
             } catch (e: Exception) {
                 Log.e(TAG, "Error stopping socks", e)
             }
-            TunnelManager.socksHandle = -1
+        }
+        TunnelManager.socksHandle = -1
+
+        if (isProxyActive || NativeCoreBridge.isProxyRunningNative()) {
+            try {
+                NativeCoreBridge.stopCoreNative()
+            } catch (e: Exception) {
+                Log.e(TAG, "Error stopping core in SOCKS mode", e)
+            }
+            isProxyActive = false
         }
 
         TunnelManager.updateState(TunnelStatus.DISCONNECTED)
@@ -187,10 +344,10 @@ class TravonetSocksService : Service() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             val channel = NotificationChannel(
                 CHANNEL_ID,
-                "TravonetWG SOCKS5",
+                "TravonetVPN SOCKS5",
                 NotificationManager.IMPORTANCE_LOW
             ).apply {
-                description = "Статус SOCKS5 прокси TravonetWG"
+                description = "Статус SOCKS5 прокси TravonetVPN"
             }
             val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
             nm.createNotificationChannel(channel)

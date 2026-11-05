@@ -86,6 +86,11 @@ object PingHelper {
             return@withContext pingConnectedTunnel(currentStatus.mode)
         }
 
+        val route = com.travonet.wireguard.core.CoreRouter.route(profile.rawConfig)
+        if (route.targetCore != com.travonet.wireguard.core.CoreType.TRAVONET_WG) {
+            return@withContext null
+        }
+
         // Если туннель выключен: поднимаем временный изолированный SOCKS5 без создания VPN
         val freePort = try {
             ServerSocket(0).use { it.localPort }
@@ -200,7 +205,7 @@ object PingHelper {
             input.read(skipBuf)
 
             // 3. Send HTTP request
-            val httpReq = "GET $HTTP_PATH HTTP/1.1\r\nHost: $TARGET_HOST\r\nConnection: close\r\nUser-Agent: TravonetWG/Ping\r\n\r\n"
+            val httpReq = "GET $HTTP_PATH HTTP/1.1\r\nHost: $TARGET_HOST\r\nConnection: close\r\nUser-Agent: TravonetVPN/Ping\r\n\r\n"
             out.write(httpReq.toByteArray(Charsets.US_ASCII))
             out.flush()
 

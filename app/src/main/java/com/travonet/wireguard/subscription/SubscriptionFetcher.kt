@@ -138,23 +138,37 @@ object SubscriptionFetcher {
                 defaultTitle ?: "Профиль $counter"
             }
 
-            if (line.startsWith("vpn://", ignoreCase = true) ||
-                line.startsWith("wireguard://", ignoreCase = true) ||
-                line.startsWith("wg://", ignoreCase = true)
-            ) {
-                val profile = WgConfigParser.parseProfile(
-                    name = fallbackName,
-                    rawConfig = line,
-                    id = makeProfileId(),
-                    subscriptionUrl = subscriptionUrl
+            // Check if line is any supported proxy link (VLESS, VMess, Trojan, SS, TUIC, Hysteria 2, ShadowTLS, WireGuard, AmneziaWG)
+            if (com.travonet.wireguard.parser.ProxyLinkParser.isProxyLink(line)) {
+                val profile = com.travonet.wireguard.parser.ProxyLinkParser.parse(
+                    rawUri = line,
+                    fallbackName = fallbackName,
+                    subUrl = subscriptionUrl,
+                    id = makeProfileId()
                 )
-                if (profile.rawConfig.contains("[Interface]", ignoreCase = true)) {
+                if (profile != null) {
                     profiles.add(profile)
                     counter++
+                    continue
                 }
-            } else {
-                val decodedLine = tryDecodeBase64(line)
-                if (decodedLine != null && decodedLine.contains("[Interface]", ignoreCase = true)) {
+            }
+
+            // Fallback for Base64 encoded line or INI block
+            val decodedLine = tryDecodeBase64(line)
+            if (decodedLine != null) {
+                if (com.travonet.wireguard.parser.ProxyLinkParser.isProxyLink(decodedLine)) {
+                    val profile = com.travonet.wireguard.parser.ProxyLinkParser.parse(
+                        rawUri = decodedLine,
+                        fallbackName = fallbackName,
+                        subUrl = subscriptionUrl,
+                        id = makeProfileId()
+                    )
+                    if (profile != null) {
+                        profiles.add(profile)
+                        counter++
+                        continue
+                    }
+                } else if (decodedLine.contains("[Interface]", ignoreCase = true)) {
                     val blocks = splitIniConfigs(decodedLine)
                     for (block in blocks) {
                         val fallbackBlockName = if (defaultTitle != null && blocks.size > 1) {
@@ -276,7 +290,7 @@ object SubscriptionFetcher {
         conn.connectTimeout = 15000
         conn.readTimeout = 15000
         conn.instanceFollowRedirects = true
-        conn.setRequestProperty("User-Agent", "TravonetWG-Android/1.2.0")
+        conn.setRequestProperty("User-Agent", "TravonetVPN-Android/1.2.0")
         conn.setRequestProperty("Accept", "*/*")
 
         if (conn is HttpsURLConnection) {

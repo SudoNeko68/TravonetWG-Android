@@ -33,6 +33,7 @@ import com.travonet.wireguard.model.WgProfile
 import com.travonet.wireguard.service.PingResult
 import com.travonet.wireguard.service.TunnelManager
 import com.travonet.wireguard.ui.dialogs.AddEditProfileDialog
+import com.travonet.wireguard.ui.dialogs.AddFreeTurnDialog
 import com.travonet.wireguard.ui.dialogs.DeleteConfirmDialog
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -61,6 +62,7 @@ fun ConfigsScreen(
     onUpdateSpecificSubscription: (String) -> Unit = {},
     updatingSubscriptionUrls: Set<String> = emptySet(),
     isUpdatingSubscription: Boolean = false,
+    customDelegations: Map<String, String> = emptyMap(),
     modifier: Modifier = Modifier
 ) {
     val context = LocalContext.current
@@ -69,10 +71,14 @@ fun ConfigsScreen(
     var editingProfile by remember { mutableStateOf<WgProfile?>(null) }
     var deletingProfileId by remember { mutableStateOf<String?>(null) }
     var deletingSubscription by remember { mutableStateOf<Subscription?>(null) }
+    var isDeletingAllWarp by remember { mutableStateOf(false) }
 
-    // Standalone profiles (local, WARP, manual)
-    val standaloneProfiles = remember(profiles) {
-        profiles.filter { it.subscriptionUrl.isNullOrBlank() }
+    // Standalone profiles partitioned into WARP and manual
+    val warpProfiles = remember(profiles) {
+        profiles.filter { it.isWarp() }
+    }
+    val manualProfiles = remember(profiles) {
+        profiles.filter { it.subscriptionUrl.isNullOrBlank() && !it.isWarp() }
     }
 
     // Merge explicitly registered subscriptions + any discovered from profiles
@@ -89,12 +95,15 @@ fun ConfigsScreen(
     }
 
     // Determine all group IDs for expand / collapse toggles
-    val allGroupKeys = remember(standaloneProfiles, effectiveSubscriptions) {
+    val allGroupKeys = remember(warpProfiles, manualProfiles, effectiveSubscriptions) {
         val keys = mutableSetOf<String>()
-        if (standaloneProfiles.isNotEmpty()) {
-            keys.add("standalone")
+        if (warpProfiles.isNotEmpty()) {
+            keys.add("warp")
         }
         effectiveSubscriptions.forEach { keys.add(it.url) }
+        if (manualProfiles.isNotEmpty()) {
+            keys.add("standalone")
+        }
         keys
     }
 
@@ -268,25 +277,26 @@ fun ConfigsScreen(
                 verticalArrangement = Arrangement.spacedBy(10.dp),
                 contentPadding = PaddingValues(bottom = 120.dp, top = 10.dp)
             ) {
-                // 1. Standalone profiles (Список серверов)
-                if (standaloneProfiles.isNotEmpty()) {
-                    item(key = "group_standalone") {
-                        val isExpanded = currentExpanded.contains("standalone")
-                        ServerGroupCard(
-                            title = "Список серверов",
-                            subtitle = "${standaloneProfiles.size} ${declensionProfile(standaloneProfiles.size)}",
+                // 1. Cloudflare WARP group
+                if (warpProfiles.isNotEmpty()) {
+                    item(key = "group_warp") {
+                        val isExpanded = currentExpanded.contains("warp")
+                        WarpGroupCard(
+                            profileCount = warpProfiles.size,
                             isExpanded = isExpanded,
+                            isPinging = isTestingAll && warpProfiles.any { pingResults[it.id]?.isTesting == true },
                             onToggleExpand = {
                                 expandedGroupKeys = if (isExpanded) {
-                                    currentExpanded - "standalone"
+                                    currentExpanded - "warp"
                                 } else {
-                                    currentExpanded + "standalone"
+                                    currentExpanded + "warp"
                                 }
                             },
-                            onPing = { onPingProfiles(standaloneProfiles) },
-                            isPinging = isTestingAll && standaloneProfiles.any { pingResults[it.id]?.isTesting == true }
+                            onGenerateMore = onGenerateWarp,
+                            onPing = { onPingProfiles(warpProfiles) },
+                            onDeleteAll = { isDeletingAllWarp = true }
                         ) {
-                            standaloneProfiles.forEachIndexed { idx, profile ->
+                            warpProfiles.forEachIndexed { idx, profile ->
                                 if (idx > 0) {
                                     HorizontalDivider(
                                         color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.4f),
@@ -300,6 +310,7 @@ fun ConfigsScreen(
                                     showAddresses = showAddresses,
                                     fallbackStrategy = fallbackStrategy,
                                     pingResult = pingResults[profile.id],
+                                    customDelegations = customDelegations,
                                     onSelect = { onSelectProfile(profile.id) },
                                     onEdit = { editingProfile = profile },
                                     onCopy = {
@@ -384,6 +395,55 @@ fun ConfigsScreen(
                                     showAddresses = showAddresses,
                                     fallbackStrategy = fallbackStrategy,
                                     pingResult = pingResults[profile.id],
+                                    customDelegations = customDelegations,
+                                    onSelect = { onSelectProfile(profile.id) },
+                                    onEdit = { editingProfile = profile },
+                                    onCopy = {
+                                        val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                                        val clip = android.content.ClipData.newPlainText("WireGuard Config", profile.rawConfig)
+                                        cm.setPrimaryClip(clip)
+                                        Toast.makeText(context, "Конфигурация скопирована", Toast.LENGTH_SHORT).show()
+                                    },
+                                    onDelete = { deletingProfileId = profile.id }
+                                )
+                            }
+                        }
+                    }
+                }
+
+                // 3. Standalone / manual profiles (Список серверов)
+                if (manualProfiles.isNotEmpty()) {
+                    item(key = "group_standalone") {
+                        val isExpanded = currentExpanded.contains("standalone")
+                        ServerGroupCard(
+                            title = "Список серверов",
+                            subtitle = "${manualProfiles.size} ${declensionProfile(manualProfiles.size)}",
+                            isExpanded = isExpanded,
+                            onToggleExpand = {
+                                expandedGroupKeys = if (isExpanded) {
+                                    currentExpanded - "standalone"
+                                } else {
+                                    currentExpanded + "standalone"
+                                }
+                            },
+                            onPing = { onPingProfiles(manualProfiles) },
+                            isPinging = isTestingAll && manualProfiles.any { pingResults[it.id]?.isTesting == true }
+                        ) {
+                            manualProfiles.forEachIndexed { idx, profile ->
+                                if (idx > 0) {
+                                    HorizontalDivider(
+                                        color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.4f),
+                                        thickness = 0.5.dp
+                                    )
+                                }
+                                ProfileItemRow(
+                                    profile = profile,
+                                    isSelected = profile.id == selectedProfileId,
+                                    isConnected = profile.id == connectedProfileId,
+                                    showAddresses = showAddresses,
+                                    fallbackStrategy = fallbackStrategy,
+                                    pingResult = pingResults[profile.id],
+                                    customDelegations = customDelegations,
                                     onSelect = { onSelectProfile(profile.id) },
                                     onEdit = { editingProfile = profile },
                                     onCopy = {
@@ -403,14 +463,29 @@ fun ConfigsScreen(
     }
 
     editingProfile?.let { prof ->
-        AddEditProfileDialog(
-            profile = prof,
-            onDismiss = { editingProfile = null },
-            onSave = {
-                onAddOrUpdateProfile(it)
-                editingProfile = null
-            }
-        )
+        val isFreeTurn = prof.address.contains("FreeTURN") ||
+                prof.rawConfig.contains("freeturn://", ignoreCase = true) ||
+                com.travonet.wireguard.core.CoreRouter.route(prof.rawConfig).targetCore == com.travonet.wireguard.core.CoreType.FREETURN
+
+        if (isFreeTurn) {
+            AddFreeTurnDialog(
+                initialProfile = prof,
+                onDismiss = { editingProfile = null },
+                onSave = {
+                    onAddOrUpdateProfile(it)
+                    editingProfile = null
+                }
+            )
+        } else {
+            AddEditProfileDialog(
+                profile = prof,
+                onDismiss = { editingProfile = null },
+                onSave = {
+                    onAddOrUpdateProfile(it)
+                    editingProfile = null
+                }
+            )
+        }
     }
 
     deletingProfileId?.let { profId ->
@@ -437,6 +512,181 @@ fun ConfigsScreen(
                 deletingSubscription = null
             }
         )
+    }
+
+    if (isDeletingAllWarp) {
+        DeleteConfirmDialog(
+            title = "Удалить все WARP?",
+            message = "Вы действительно хотите удалить все конфигурации Cloudflare WARP (${warpProfiles.size} шт.)?",
+            onDismiss = { isDeletingAllWarp = false },
+            onConfirm = {
+                warpProfiles.forEach { onDeleteProfile(it.id) }
+                isDeletingAllWarp = false
+            }
+        )
+    }
+}
+
+@Composable
+private fun WarpGroupCard(
+    profileCount: Int,
+    isExpanded: Boolean,
+    isPinging: Boolean,
+    onToggleExpand: () -> Unit,
+    onGenerateMore: () -> Unit,
+    onPing: () -> Unit,
+    onDeleteAll: () -> Unit,
+    content: @Composable () -> Unit
+) {
+    var showMenu by remember { mutableStateOf(false) }
+
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(16.dp),
+        colors = CardDefaults.cardColors(
+            containerColor = MaterialTheme.colorScheme.surface
+        ),
+        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f))
+    ) {
+        Column(modifier = Modifier.fillMaxWidth()) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clickable(onClick = onToggleExpand)
+                    .padding(horizontal = 12.dp, vertical = 10.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Icon(
+                    imageVector = if (isExpanded) Icons.Default.KeyboardArrowDown else Icons.AutoMirrored.Filled.KeyboardArrowRight,
+                    contentDescription = if (isExpanded) "Свернуть" else "Развернуть",
+                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.size(24.dp)
+                )
+
+                Spacer(Modifier.width(8.dp))
+
+                Icon(
+                    imageVector = Icons.Default.Cloud,
+                    contentDescription = null,
+                    tint = MaterialTheme.colorScheme.primary,
+                    modifier = Modifier.size(22.dp)
+                )
+
+                Spacer(Modifier.width(8.dp))
+
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(
+                        text = "Cloudflare WARP",
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.Bold,
+                        fontSize = 16.sp,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                    Text(
+                        text = "$profileCount ${declensionProfile(profileCount)}",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        fontSize = 12.sp,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                }
+
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    IconButton(
+                        onClick = onGenerateMore,
+                        modifier = Modifier.size(36.dp)
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.Add,
+                            contentDescription = "Сгенерировать WARP",
+                            tint = MaterialTheme.colorScheme.primary,
+                            modifier = Modifier.size(20.dp)
+                        )
+                    }
+
+                    IconButton(
+                        onClick = onPing,
+                        enabled = !isPinging && profileCount > 0,
+                        modifier = Modifier.size(36.dp)
+                    ) {
+                        if (isPinging) {
+                            CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
+                        } else {
+                            Icon(
+                                imageVector = Icons.Default.Speed,
+                                contentDescription = "Тест скорости",
+                                tint = if (profileCount > 0) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.4f),
+                                modifier = Modifier.size(20.dp)
+                            )
+                        }
+                    }
+
+                    Box {
+                        IconButton(
+                            onClick = { showMenu = true },
+                            modifier = Modifier.size(36.dp)
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.MoreVert,
+                                contentDescription = "Действия с WARP",
+                                tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                                modifier = Modifier.size(20.dp)
+                            )
+                        }
+
+                        DropdownMenu(
+                            expanded = showMenu,
+                            onDismissRequest = { showMenu = false }
+                        ) {
+                            DropdownMenuItem(
+                                text = { Text("Сгенерировать ещё") },
+                                onClick = {
+                                    showMenu = false
+                                    onGenerateMore()
+                                },
+                                leadingIcon = {
+                                    Icon(Icons.Default.Cloud, contentDescription = null, modifier = Modifier.size(18.dp))
+                                }
+                            )
+
+                            HorizontalDivider()
+
+                            DropdownMenuItem(
+                                text = {
+                                    Text(
+                                        "Удалить все WARP",
+                                        color = MaterialTheme.colorScheme.error,
+                                        fontWeight = FontWeight.SemiBold
+                                    )
+                                },
+                                onClick = {
+                                    showMenu = false
+                                    onDeleteAll()
+                                },
+                                leadingIcon = {
+                                    Icon(
+                                        Icons.Default.Delete,
+                                        contentDescription = null,
+                                        tint = MaterialTheme.colorScheme.error,
+                                        modifier = Modifier.size(18.dp)
+                                    )
+                                }
+                            )
+                        }
+                    }
+                }
+            }
+
+            if (isExpanded) {
+                HorizontalDivider(
+                    color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f),
+                    thickness = 0.8.dp
+                )
+                content()
+            }
+        }
     }
 }
 
@@ -765,6 +1015,7 @@ private fun ProfileItemRow(
     showAddresses: Boolean,
     fallbackStrategy: EvasionStrategy,
     pingResult: PingResult?,
+    customDelegations: Map<String, String> = emptyMap(),
     onSelect: () -> Unit,
     onEdit: () -> Unit,
     onCopy: () -> Unit,
@@ -861,20 +1112,25 @@ private fun ProfileItemRow(
 
             Spacer(Modifier.height(2.dp))
 
-            // Subtitle: protocol / endpoint / strategy
-            val protoLabel = if (profile.rawConfig.contains("Jc =") || profile.rawConfig.contains("H1 =")) {
-                "AmneziaWG"
-            } else {
-                "WireGuard"
+            // Subtitle: protocol / core / endpoint / details
+            val routing = remember(profile.rawConfig, customDelegations) {
+                com.travonet.wireguard.core.CoreRouter.route(profile.rawConfig, customDelegations)
             }
+            val protoLabel = routing.detectedProtocol
+            val targetCoreName = routing.targetCore.title
 
             val detailsText = buildString {
                 append(protoLabel)
-                if (showAddresses && profile.endpoint.isNotBlank()) {
+                append(" • ")
+                append(targetCoreName)
+                if (profile.endpoint.isNotBlank()) {
                     append(" • ").append(profile.endpoint)
                 }
+                if (profile.address.isNotBlank() && !profile.address.contains("/")) {
+                    append(" (").append(profile.address).append(")")
+                }
                 if (profile.hasEmbeddedStrategy) {
-                    append(" • ⚡ ").append(profile.embeddedStrategy)
+                    append(" • ").append(profile.embeddedStrategy)
                 }
             }
 
@@ -1012,3 +1268,13 @@ private fun declensionProfile(count: Int): String {
         else -> "конфигураций"
     }
 }
+
+private fun WgProfile.isWarp(): Boolean {
+    if (!subscriptionUrl.isNullOrBlank()) return false
+    if (name.contains("WARP", ignoreCase = true)) return true
+    val ep = endpoint.lowercase()
+    if (ep.contains("cloudflareclient.com")) return true
+    if (ep.startsWith("162.159.192.") || ep.startsWith("162.159.193.") || ep.startsWith("162.159.195.")) return true
+    return false
+}
+

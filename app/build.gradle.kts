@@ -37,7 +37,7 @@ android {
     }
 
     defaultConfig {
-        applicationId = "com.travonet.wireguard"
+        applicationId = "com.travonet.vpn"
         minSdk = 28
         targetSdk = 37
         versionCode = 1205
@@ -80,6 +80,7 @@ android {
     }
     packaging {
         jniLibs {
+            useLegacyPackaging = true
             excludes += "**/libwg-go.so"
         }
     }

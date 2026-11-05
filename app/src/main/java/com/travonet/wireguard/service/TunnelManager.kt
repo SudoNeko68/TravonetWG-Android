@@ -26,6 +26,17 @@ object TunnelManager {
     private val _stats = MutableStateFlow(TunnelStats())
     val stats: StateFlow<TunnelStats> = _stats.asStateFlow()
 
+    private val _captchaUrl = MutableStateFlow<String?>(null)
+    val captchaUrl: StateFlow<String?> = _captchaUrl.asStateFlow()
+
+    fun showCaptcha(url: String) {
+        _captchaUrl.value = url
+    }
+
+    fun hideCaptcha() {
+        _captchaUrl.value = null
+    }
+
     // Holds the active handle for VpnService or SOCKS5
     var vpnHandle: Int = -1
     var socksHandle: Int = -1
@@ -38,6 +49,9 @@ object TunnelManager {
         mode: TunnelMode = TunnelMode.VPN,
         strategyName: String = ""
     ) {
+        if (status == TunnelStatus.DISCONNECTED || status == TunnelStatus.ERROR) {
+            hideCaptcha()
+        }
         _state.value = TunnelState(
             status = status,
             message = message,
@@ -118,19 +132,30 @@ object TunnelManager {
         // Emergency safeguard: immediately terminate native handles if active
         val currentVpnHandle = vpnHandle
         if (currentVpnHandle >= 0) {
-            try {
-                org.travonet.backend.GoBackend.wgTurnOff(currentVpnHandle)
-            } catch (e: Exception) {
-                // ignore
+            if (currentVpnHandle in 0 until 90000) {
+                try {
+                    org.travonet.backend.GoBackend.wgTurnOff(currentVpnHandle)
+                } catch (e: Exception) {
+                    // ignore
+                }
             }
             vpnHandle = -1
         }
-        val currentSocksHandle = socksHandle
-        if (currentSocksHandle >= 0) {
+        if (com.freevpn.coreloader.NativeCoreBridge.isProxyRunningNative()) {
             try {
-                org.travonet.backend.GoBackend.wgStopSocks5(currentSocksHandle)
+                com.freevpn.coreloader.NativeCoreBridge.stopCoreNative()
             } catch (e: Exception) {
                 // ignore
+            }
+        }
+        val currentSocksHandle = socksHandle
+        if (currentSocksHandle >= 0) {
+            if (currentSocksHandle in 0 until 90000) {
+                try {
+                    org.travonet.backend.GoBackend.wgStopSocks5(currentSocksHandle)
+                } catch (e: Exception) {
+                    // ignore
+                }
             }
             socksHandle = -1
         }

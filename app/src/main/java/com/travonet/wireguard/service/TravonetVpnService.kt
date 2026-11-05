@@ -50,7 +50,9 @@ class TravonetVpnService : VpnService() {
     // by the shared value would tear down a freshly started tunnel.
     private var activeHandle: Int = -1
     private var activePfd: ParcelFileDescriptor? = null
+    private var activeTunFd: Int = -1
     @Volatile private var destroyed = false
+    @Volatile private var isProxyActive = false
     private var wakeLock: PowerManager.WakeLock? = null
 
     companion object {
@@ -66,6 +68,19 @@ class TravonetVpnService : VpnService() {
     override fun onCreate() {
         super.onCreate()
         createNotificationChannel()
+        com.freevpn.coreloader.NativeCoreBridge.setCoreEventListener(object : com.freevpn.coreloader.CoreEventListener {
+            override fun onCoreEvent(eventType: Int, payload: String) {
+                when (eventType) {
+                    1 -> {
+                        val url = if (payload.isNotBlank()) payload else "http://127.0.0.1:8765"
+                        TunnelManager.showCaptcha(url)
+                    }
+                    2 -> {
+                        TunnelManager.hideCaptcha()
+                    }
+                }
+            }
+        })
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -112,12 +127,24 @@ class TravonetVpnService : VpnService() {
             // may already own TunnelManager.vpnHandle.
             releaseTunnelLocked()
 
+            val routing = com.travonet.wireguard.core.CoreRouter.route(
+                profile.rawConfig,
+                AppRepository(this@TravonetVpnService).getProtocolDelegations()
+            )
+            if (routing.targetCore == com.travonet.wireguard.core.CoreType.FREETURN) {
+                startFreeTurnTunnelLocked(profile, routing, strategy, attempt)
+                return
+            } else if (routing.targetCore != com.travonet.wireguard.core.CoreType.TRAVONET_WG) {
+                startProxyTunnelLocked(profile, routing)
+                return
+            }
+
             val parsed = WgConfigParser.parse(profile.rawConfig)
             val preparedConfig = WgConfigParser.prepareConfigForLaunch(profile, strategy)
             val resolvedConfig = WgConfigParser.resolveConfigEndpoints(preparedConfig)
 
             val builder = Builder()
-                .setSession("TravonetWG - ${profile.name}")
+                .setSession("TravonetVPN - ${profile.name}")
                 .setMtu(parsed.iface.mtu)
                 .setBlocking(true)
 
@@ -272,11 +299,8 @@ class TravonetVpnService : VpnService() {
                 releaseWakeLock()
             }
 
-            if (repository.isForegroundServiceEnabled()) {
-                startForegroundServiceNotification(profile.name, activeStrategyDesc, "Подключено")
-            } else {
-                stopForeground(STOP_FOREGROUND_REMOVE)
-            }
+            // Always maintain foreground service status while tunnel is connected
+            startForegroundServiceNotification(profile.name, activeStrategyDesc, "Подключено")
             startStatsPolling(handle, profile.name, activeStrategyDesc)
             startHandshakeWatchdog(handle, profile, strategy, attempt)
 
@@ -393,6 +417,8 @@ class TravonetVpnService : VpnService() {
 
             // Auto-reconnect watchdog if connection drops after initial handshake
             var staleCount = 0
+            var prevTxBytes = -1L
+            var prevRxBytes = -1L
             while (isActive && TunnelManager.vpnHandle == handle) {
                 delay(5000)
                 val configDump = try {
@@ -402,10 +428,21 @@ class TravonetVpnService : VpnService() {
                 }
                 val stats = TunnelManager.parseUapiStats(configDump)
                 val nowSec = System.currentTimeMillis() / 1000
-                if (stats.lastHandshakeSec > 0L && (nowSec - stats.lastHandshakeSec) > 150) {
+
+                // Соединение считается потерянным ТОЛЬКО если:
+                // 1. Был первоначальный handshake (lastHandshakeSec > 0).
+                // 2. Идет отправка пакетов (txBytes растет), но нет ответа (rxBytes не меняется).
+                // 3. Handshake не обновлялся более 180 секунд (Reject-After-Time в WireGuard).
+                // Если телефон в режиме ожидания (нет отправки пакетов), WireGuard намеренно
+                // не производит handshake (тишина в эфире) — туннель не должен разрываться.
+                val hasOutgoingTraffic = prevTxBytes >= 0L && stats.txBytes > prevTxBytes
+                val noIncomingTraffic = prevRxBytes >= 0L && stats.rxBytes == prevRxBytes
+                val isHandshakeStale = stats.lastHandshakeSec > 0L && (nowSec - stats.lastHandshakeSec) > 180
+
+                if (hasOutgoingTraffic && noIncomingTraffic && isHandshakeStale) {
                     staleCount++
-                    if (staleCount >= 4) {
-                        Log.w(TAG, "Connection lost (handshake stale for ${nowSec - stats.lastHandshakeSec}s); auto-reconnecting...")
+                    if (staleCount >= 4) { // 20 секунд подтвержденного отсутствия ответа при отправке
+                        Log.w(TAG, "Connection lost (outgoing traffic without response for ${nowSec - stats.lastHandshakeSec}s); auto-reconnecting...")
                         TunnelManager.updateState(TunnelStatus.CONNECTING, "Восстановление соединения...")
                         tunnelMutex.withLock {
                             releaseTunnelLocked()
@@ -420,6 +457,388 @@ class TravonetVpnService : VpnService() {
                     }
                 } else {
                     staleCount = 0
+                }
+
+                prevTxBytes = stats.txBytes
+                prevRxBytes = stats.rxBytes
+            }
+        }
+    }
+
+    private suspend fun startFreeTurnTunnelLocked(
+        profile: com.travonet.wireguard.model.WgProfile,
+        routing: com.travonet.wireguard.core.RoutingResult,
+        strategy: com.travonet.wireguard.model.EvasionStrategy,
+        attempt: Int = 0
+    ) {
+        val targetCore = routing.targetCore
+        if (!com.travonet.wireguard.core.CoreManager.isInstalled(this@TravonetVpnService, targetCore)) {
+            TunnelManager.updateState(
+                TunnelStatus.ERROR,
+                "Не установлено ядро ${targetCore.title}. Проверьте его во вкладке «Ядра»."
+            )
+            stopForeground(STOP_FOREGROUND_REMOVE)
+            stopSelf()
+            return
+        }
+
+        val corePath = com.travonet.wireguard.core.CoreManager.getCoreFilePath(this@TravonetVpnService, targetCore)
+        if (corePath == null) {
+            TunnelManager.updateState(
+                TunnelStatus.ERROR,
+                "Файл ядра ${targetCore.title} не найден."
+            )
+            stopForeground(STOP_FOREGROUND_REMOVE)
+            stopSelf()
+            return
+        }
+
+        val configStr = try {
+            com.travonet.wireguard.parser.ProxyConfigSynthesizer.synthesize(profile.rawConfig, targetCore)
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to synthesize FreeTURN config", e)
+            TunnelManager.updateState(
+                TunnelStatus.ERROR,
+                "Ошибка формирования конфигурации FreeTURN: ${e.localizedMessage ?: "Синтаксическая ошибка"}"
+            )
+            stopForeground(STOP_FOREGROUND_REMOVE)
+            stopSelf()
+            return
+        }
+
+        val wgConfigRaw = com.travonet.wireguard.parser.ProxyLinkParser.extractEmbeddedWgConfig(profile.rawConfig)
+        val needsTun = com.freevpn.coreloader.NativeCoreBridge.checkNeedsTunNative(corePath, configStr) || (wgConfigRaw != null)
+
+        var tunFd = -1
+        if (needsTun) {
+            val wgConfigToParse = wgConfigRaw ?: profile.rawConfig
+            val parsed = try {
+                WgConfigParser.parse(wgConfigToParse)
+            } catch (e: Exception) {
+                null
+            }
+
+            val mtu = if (parsed != null && parsed.iface.mtu in 1120..1420) parsed.iface.mtu else 1280
+            val builder = Builder()
+                .setSession("TravonetVPN - ${profile.name} (FreeTURN)")
+                .setMtu(mtu)
+                .setBlocking(true)
+
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                builder.setMetered(false)
+            }
+
+            var hasIpv4 = false
+            var hasIpv6 = false
+            parsed?.iface?.addresses?.forEach { addrStr ->
+                try {
+                    val parts = addrStr.split("/")
+                    val ip = parts[0].trim()
+                    val isV6 = ip.contains(":")
+                    val prefix = if (parts.size > 1) parts[1].trim().toInt() else if (isV6) 128 else 32
+                    builder.addAddress(ip, prefix)
+                    if (isV6) hasIpv6 = true else hasIpv4 = true
+                } catch (e: Exception) {
+                    Log.w(TAG, "Failed to parse address: $addrStr", e)
+                }
+            }
+            if (!hasIpv4 && !hasIpv6) {
+                builder.addAddress("10.13.13.3", 32)
+            }
+
+            var routeCount = 0
+            parsed?.peers?.forEach { peer ->
+                peer.allowedIps.forEach { routeStr ->
+                    try {
+                        val parts = routeStr.split("/")
+                        val ip = parts[0].trim()
+                        val isV6 = ip.contains(":")
+                        if (isV6 && !hasIpv6) {
+                            return@forEach
+                        }
+                        if (!isV6 && !hasIpv4) {
+                            return@forEach
+                        }
+                        val prefix = if (parts.size > 1) parts[1].trim().toInt() else if (isV6) 128 else 32
+                        builder.addRoute(ip, prefix)
+                        routeCount++
+                    } catch (e: Exception) {
+                        Log.w(TAG, "Failed to parse allowed ip: $routeStr", e)
+                    }
+                }
+            }
+            if (routeCount == 0) {
+                if (hasIpv4) builder.addRoute("0.0.0.0", 0)
+                if (hasIpv6) builder.addRoute("::", 0)
+            }
+
+            builder.allowFamily(android.system.OsConstants.AF_INET)
+            builder.allowFamily(android.system.OsConstants.AF_INET6)
+
+            parsed?.iface?.dnsServers?.forEach { dnsStr ->
+                try {
+                    val dns = dnsStr.trim()
+                    val isV6 = dns.contains(":")
+                    if (isV6 && !hasIpv6) {
+                        return@forEach
+                    }
+                    builder.addDnsServer(dns)
+                } catch (e: Exception) {
+                    Log.w(TAG, "Failed to parse DNS: $dnsStr", e)
+                }
+            }
+            if (parsed == null || parsed.iface.dnsServers.isEmpty()) {
+                builder.addDnsServer("1.1.1.1")
+                builder.addDnsServer("1.0.0.1")
+            }
+
+            try {
+                builder.addDisallowedApplication(packageName)
+            } catch (e: Exception) {
+                Log.w(TAG, "Failed to exclude package from TUN", e)
+            }
+
+            val currentPfd = builder.establish()
+            if (currentPfd == null) {
+                TunnelManager.updateState(TunnelStatus.ERROR, "Не удалось создать системный TUN интерфейс для FreeTURN")
+                stopForeground(STOP_FOREGROUND_REMOVE)
+                stopSelf()
+                return
+            }
+            activePfd = currentPfd
+            tunFd = currentPfd.detachFd()
+            activeTunFd = tunFd
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                setUnderlyingNetworks(null)
+            }
+            registerNetworkCallback()
+        }
+
+        var lastErr = ""
+        val started = runCatching {
+            var ok = false
+            val t = kotlin.concurrent.thread(name = "FreeTurn-Init", start = true) {
+                ok = com.freevpn.coreloader.NativeCoreBridge.startProxyWithCore(corePath, configStr, tunFd)
+                if (!ok) {
+                    lastErr = com.freevpn.coreloader.NativeCoreBridge.getLastCoreErrorNative()
+                }
+            }
+            t.join()
+            ok
+        }.getOrDefault(false)
+
+        if (!started) {
+            val err = lastErr
+            Log.e(TAG, "FreeTURN core failed to start: $err")
+            if (activeTunFd >= 0) {
+                try {
+                    ParcelFileDescriptor.adoptFd(activeTunFd).close()
+                } catch (_: Exception) {}
+                activeTunFd = -1
+            }
+            activePfd = null
+            val displayErr = if (err.isNotBlank()) err else "Не удалось запустить ядро FreeTURN"
+            TunnelManager.updateState(TunnelStatus.ERROR, displayErr)
+            stopForeground(STOP_FOREGROUND_REMOVE)
+            stopSelf()
+            return
+        }
+
+        isProxyActive = true
+        activeHandle = 99998
+        TunnelManager.vpnHandle = 99998
+        val activeDesc = if (needsTun) "FreeTURN (VK Relay) + WireGuard" else "FreeTURN Релей (127.0.0.1:9000)"
+        TunnelManager.updateState(
+            status = TunnelStatus.CONNECTED,
+            profileName = profile.name,
+            profileId = profile.id,
+            mode = TunnelMode.VPN,
+            strategyName = activeDesc
+        )
+
+        val repository = AppRepository(this@TravonetVpnService)
+        if (repository.isWakeLockEnabled()) acquireWakeLock() else releaseWakeLock()
+        if (repository.isForegroundServiceEnabled()) {
+            startForegroundServiceNotification(profile.name, activeDesc, "Подключено")
+        } else {
+            stopForeground(STOP_FOREGROUND_REMOVE)
+        }
+        startProxyWatchdog(profile.name, "FreeTURN")
+    }
+
+    private fun startProxyTunnelLocked(
+        profile: com.travonet.wireguard.model.WgProfile,
+        routing: com.travonet.wireguard.core.RoutingResult
+    ) {
+        val targetCore = routing.targetCore
+        if (!com.travonet.wireguard.core.CoreManager.isInstalled(this@TravonetVpnService, targetCore)) {
+            TunnelManager.updateState(
+                TunnelStatus.ERROR,
+                "Не установлено ядро ${targetCore.title} для ${routing.detectedProtocol}. Установите его во вкладке «Ядра»."
+            )
+            stopForeground(STOP_FOREGROUND_REMOVE)
+            stopSelf()
+            return
+        }
+
+        val corePath = com.travonet.wireguard.core.CoreManager.getCoreFilePath(this@TravonetVpnService, targetCore)
+        if (corePath == null) {
+            TunnelManager.updateState(
+                TunnelStatus.ERROR,
+                "Файл ядра ${targetCore.title} не найден."
+            )
+            stopForeground(STOP_FOREGROUND_REMOVE)
+            stopSelf()
+            return
+        }
+
+        val configJson = try {
+            com.travonet.wireguard.parser.ProxyConfigSynthesizer.synthesize(
+                profile.rawConfig,
+                targetCore,
+                mode = com.travonet.wireguard.model.TunnelMode.VPN
+            )
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to synthesize proxy config", e)
+            TunnelManager.updateState(
+                TunnelStatus.ERROR,
+                "Ошибка формирования конфигурации: ${e.localizedMessage ?: "Синтаксическая ошибка"}"
+            )
+            stopForeground(STOP_FOREGROUND_REMOVE)
+            stopSelf()
+            return
+        }
+
+        val builder = Builder()
+            .setSession("TravonetVPN - ${profile.name}")
+            .setMtu(1420)
+            .setBlocking(true)
+            .addAddress("172.19.0.1", 30)
+            .addRoute("0.0.0.0", 0)
+            .addDnsServer("1.1.1.1")
+            .addDnsServer("8.8.8.8")
+
+        try {
+            builder.addAddress("fdfe:dcba:9876::1", 126)
+            builder.addRoute("::", 0)
+            builder.addDnsServer("2606:4700:4700::1111")
+        } catch (e: Exception) {
+            Log.w(TAG, "IPv6 address/route not supported: ${e.message}")
+        }
+
+        builder.allowFamily(android.system.OsConstants.AF_INET)
+        builder.allowFamily(android.system.OsConstants.AF_INET6)
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            builder.setMetered(false)
+        }
+
+        try {
+            builder.addDisallowedApplication(packageName)
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to exclude package from TUN", e)
+        }
+
+        val currentPfd = builder.establish()
+        if (currentPfd == null) {
+            TunnelManager.updateState(TunnelStatus.ERROR, "Не удалось создать системный TUN интерфейс")
+            stopForeground(STOP_FOREGROUND_REMOVE)
+            stopSelf()
+            return
+        }
+        activePfd = currentPfd
+        val tunFd = currentPfd.detachFd()
+        activeTunFd = tunFd
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            setUnderlyingNetworks(null)
+        }
+        registerNetworkCallback()
+
+        val started = com.freevpn.coreloader.NativeCoreBridge.startProxyWithCore(corePath, configJson, tunFd)
+        if (!started) {
+            val err = com.freevpn.coreloader.NativeCoreBridge.getLastCoreErrorNative()
+            Log.e(TAG, "Proxy core failed to start: $err")
+            if (activeTunFd >= 0) {
+                try {
+                    ParcelFileDescriptor.adoptFd(activeTunFd).close()
+                } catch (_: Exception) {}
+                activeTunFd = -1
+            }
+            activePfd = null
+            val displayErr = if (err.isNotBlank()) err else "Не удалось запустить ядро ${targetCore.title}"
+            TunnelManager.updateState(TunnelStatus.ERROR, displayErr)
+            stopForeground(STOP_FOREGROUND_REMOVE)
+            stopSelf()
+            return
+        }
+
+        isProxyActive = true
+        activeHandle = 99999
+        TunnelManager.vpnHandle = 99999
+
+        val coreTitle = targetCore.title
+        val activeDesc = "Ядро: $coreTitle"
+        TunnelManager.updateState(
+            status = TunnelStatus.CONNECTED,
+            profileName = profile.name,
+            profileId = profile.id,
+            mode = TunnelMode.VPN,
+            strategyName = activeDesc
+        )
+
+        val repository = AppRepository(this@TravonetVpnService)
+        if (repository.isWakeLockEnabled()) {
+            acquireWakeLock()
+        } else {
+            releaseWakeLock()
+        }
+
+        // Always maintain foreground service status while proxy core is active
+        startForegroundServiceNotification(profile.name, activeDesc, "Подключено")
+
+        startProxyWatchdog(profile.name, coreTitle)
+    }
+
+    private fun startProxyWatchdog(profileName: String, coreTitle: String) {
+        statsJob?.cancel()
+        healthJob?.cancel()
+        statsJob = serviceScope.launch {
+            val repository = AppRepository(this@TravonetVpnService)
+            val myUid = android.os.Process.myUid()
+            val startTx = android.net.TrafficStats.getUidTxBytes(myUid).let { if (it < 0) 0L else it }
+            val startRx = android.net.TrafficStats.getUidRxBytes(myUid).let { if (it < 0) 0L else it }
+
+            while (isActive && isProxyActive) {
+                delay(1500)
+                if (!com.freevpn.coreloader.NativeCoreBridge.isProxyRunningNative()) {
+                    val err = com.freevpn.coreloader.NativeCoreBridge.getLastCoreErrorNative()
+                    Log.w(TAG, "Proxy core stopped unexpectedly: $err")
+                    TunnelManager.updateState(
+                        TunnelStatus.ERROR,
+                        if (err.isNotBlank()) err else "Ядро $coreTitle аварийно завершило работу"
+                    )
+                    stopTunnelAsync()
+                    break
+                }
+
+                val curTx = android.net.TrafficStats.getUidTxBytes(myUid)
+                val curRx = android.net.TrafficStats.getUidRxBytes(myUid)
+                val tx = if (curTx >= startTx) curTx - startTx else 0L
+                val rx = if (curRx >= startRx) curRx - startRx else 0L
+                val stats = com.travonet.wireguard.model.TunnelStats(txBytes = tx, rxBytes = rx)
+                TunnelManager.updateStats(stats)
+
+                if (repository.isForegroundServiceEnabled()) {
+                    val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+                    nm.notify(
+                        NOTIFICATION_ID,
+                        buildNotification(
+                            profileName,
+                            "Ядро: $coreTitle",
+                            "↑ ${stats.formattedTx()}  ↓ ${stats.formattedRx()}"
+                        )
+                    )
                 }
             }
         }
@@ -438,16 +857,30 @@ class TravonetVpnService : VpnService() {
         val currentHandle = activeHandle
         val globalHandle = TunnelManager.vpnHandle
         val handleToKill = if (currentHandle >= 0) currentHandle else globalHandle
-        if (handleToKill >= 0) {
+        if (handleToKill in 0 until 90000) {
             try {
                 GoBackend.wgTurnOff(handleToKill)
             } catch (e: Exception) {
                 Log.e(TAG, "Error in emergency wgTurnOff", e)
             }
         }
+        if (isProxyActive || com.freevpn.coreloader.NativeCoreBridge.isProxyRunningNative()) {
+            try {
+                com.freevpn.coreloader.NativeCoreBridge.stopCoreNative()
+            } catch (e: Exception) {
+                Log.e(TAG, "Error in emergency stopCoreNative", e)
+            }
+            isProxyActive = false
+        }
         activeHandle = -1
         TunnelManager.vpnHandle = -1
 
+        if (activeTunFd >= 0) {
+            try {
+                ParcelFileDescriptor.adoptFd(activeTunFd).close()
+            } catch (_: Exception) {}
+            activeTunFd = -1
+        }
         try {
             activePfd?.close()
         } catch (e: Exception) {
@@ -491,7 +924,7 @@ class TravonetVpnService : VpnService() {
         val handle = activeHandle
         activeHandle = -1
 
-        if (handle >= 0) {
+        if (handle in 0 until 90000) {
             try {
                 GoBackend.wgTurnOff(handle)
             } catch (e: Exception) {
@@ -513,6 +946,26 @@ class TravonetVpnService : VpnService() {
             }
         }
 
+        if (isProxyActive || com.freevpn.coreloader.NativeCoreBridge.isProxyRunningNative()) {
+            try {
+                com.freevpn.coreloader.NativeCoreBridge.stopCoreNative()
+            } catch (e: Exception) {
+                Log.e(TAG, "Error in stopCoreNative during release", e)
+            }
+            isProxyActive = false
+        }
+        if (TunnelManager.vpnHandle >= 90000) {
+            TunnelManager.vpnHandle = -1
+        }
+
+        if (activeTunFd >= 0) {
+            try {
+                ParcelFileDescriptor.adoptFd(activeTunFd).close()
+            } catch (e: Exception) {
+                Log.w(TAG, "Error closing activeTunFd in releaseTunnelLocked", e)
+            }
+            activeTunFd = -1
+        }
         try {
             activePfd?.close()
         } catch (e: Exception) {
@@ -590,7 +1043,7 @@ class TravonetVpnService : VpnService() {
         if (wakeLock?.isHeld == true) return
         try {
             val powerManager = getSystemService(Context.POWER_SERVICE) as? PowerManager
-            wakeLock = powerManager?.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "TravonetWG::VpnWakeLock")?.apply {
+            wakeLock = powerManager?.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "TravonetVPN::VpnWakeLock")?.apply {
                 setReferenceCounted(false)
                 acquire(12 * 60 * 60 * 1000L) // 12 hours max safety timeout
             }
@@ -617,10 +1070,10 @@ class TravonetVpnService : VpnService() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             val channel = NotificationChannel(
                 CHANNEL_ID,
-                "TravonetWG VPN",
+                "TravonetVPN",
                 NotificationManager.IMPORTANCE_LOW
             ).apply {
-                description = "Статус подключения VPN-туннеля TravonetWG"
+                description = "Статус подключения VPN-туннеля TravonetVPN"
             }
             val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
             nm.createNotificationChannel(channel)
@@ -630,7 +1083,7 @@ class TravonetVpnService : VpnService() {
     private fun startForegroundServiceNotification(profileName: String, strategyDesc: String, subtext: String) {
         val notification = buildNotification(profileName, strategyDesc, subtext)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
-            startForeground(NOTIFICATION_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_SYSTEM_EXEMPTED)
+            startForeground(NOTIFICATION_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
         } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             startForeground(NOTIFICATION_ID, notification, 0)
         } else {
@@ -661,7 +1114,7 @@ class TravonetVpnService : VpnService() {
 
         return NotificationCompat.Builder(this, CHANNEL_ID)
             .setSmallIcon(R.mipmap.ic_launcher)
-            .setContentTitle("TravonetWG: $profileName")
+            .setContentTitle("TravonetVPN: $profileName")
             .setContentText("Обход DPI: $strategyDesc")
             .setSubText(subtext)
             .setOngoing(true)

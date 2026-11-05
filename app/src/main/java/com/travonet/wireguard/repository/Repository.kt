@@ -91,15 +91,8 @@ class AppRepository(context: Context) {
 
     fun replaceSubscriptionProfiles(subUrl: String, newProfiles: List<WgProfile>) {
         val current = getProfiles().toMutableList()
-        val newIds = newProfiles.map { it.id }.toSet()
-
-        // Cleanly replace old profiles belonging to this subscription or with matching IDs/endpoints
-        current.removeAll { p ->
-            p.subscriptionUrl == subUrl ||
-            p.id in newIds ||
-            newProfiles.any { np -> np.name == p.name && np.endpoint == p.endpoint }
-        }
-
+        // Only remove profiles belonging to this specific subscription
+        current.removeAll { p -> p.subscriptionUrl == subUrl }
         current.addAll(newProfiles)
         saveProfiles(current)
     }
@@ -438,5 +431,42 @@ class AppRepository(context: Context) {
 
     fun setLastSubscriptionUpdate(timestamp: Long) {
         prefs.edit().putLong("subscription_last_update", timestamp).apply()
+    }
+
+    // Protocol Delegations
+    fun getProtocolDelegations(): Map<String, String> {
+        val raw = prefs.getString("protocol_delegations", null) ?: return emptyMap()
+        return try {
+            val json = JSONObject(raw)
+            val map = mutableMapOf<String, String>()
+            val keys = json.keys()
+            while (keys.hasNext()) {
+                val k = keys.next()
+                map[k] = json.getString(k)
+            }
+            map
+        } catch (_: Exception) {
+            emptyMap()
+        }
+    }
+
+    fun setProtocolDelegation(protocolId: String, coreId: String) {
+        val current = getProtocolDelegations().toMutableMap()
+        current[protocolId] = coreId
+        val json = JSONObject()
+        current.forEach { (k, v) -> json.put(k, v) }
+        prefs.edit().putString("protocol_delegations", json.toString()).apply()
+    }
+
+    fun resetProtocolDelegations() {
+        prefs.edit().remove("protocol_delegations").apply()
+    }
+
+    fun getSelectedCoreVersion(coreId: String): String? {
+        return prefs.getString("core_version_$coreId", null)
+    }
+
+    fun setSelectedCoreVersion(coreId: String, version: String) {
+        prefs.edit().putString("core_version_$coreId", version).apply()
     }
 }

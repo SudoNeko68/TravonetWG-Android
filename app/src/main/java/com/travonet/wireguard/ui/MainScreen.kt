@@ -35,12 +35,17 @@ import com.travonet.wireguard.service.TunnelManager
 import com.travonet.wireguard.subscription.SubscriptionFetcher
 import com.travonet.wireguard.ui.components.BottomControlBar
 import com.travonet.wireguard.ui.dialogs.AddEditProfileDialog
+import com.travonet.wireguard.ui.dialogs.AddFreeTurnDialog
 import com.travonet.wireguard.ui.dialogs.AppSettingsDialog
+import com.travonet.wireguard.ui.dialogs.CaptchaDialog
 import com.travonet.wireguard.ui.dialogs.SubscriptionDialog
 import com.travonet.wireguard.ui.dialogs.WarpProgressDialog
 import com.travonet.wireguard.ui.dialogs.WarpRelayDialog
 import com.travonet.wireguard.ui.dialogs.WarpUiState
+import androidx.compose.material.icons.filled.PhoneInTalk
+import com.travonet.wireguard.core.CoreManager
 import com.travonet.wireguard.ui.screens.ConfigsScreen
+import com.travonet.wireguard.ui.screens.CoresScreen
 import com.travonet.wireguard.ui.screens.StrategiesScreen
 import com.travonet.wireguard.warp.WarpGenerator
 import kotlinx.coroutines.Dispatchers
@@ -58,8 +63,9 @@ fun MainScreen(
 ) {
     val context = LocalContext.current
     val repository = remember { AppRepository(context) }
+    val coreManager = remember { CoreManager(context) }
 
-    val pagerState = rememberPagerState(pageCount = { 2 })
+    val pagerState = rememberPagerState(pageCount = { 3 })
     var profiles by remember { mutableStateOf(repository.getProfiles()) }
     var selectedProfileId by remember { mutableStateOf(repository.getSelectedProfileId()) }
 
@@ -88,11 +94,14 @@ fun MainScreen(
     var warpRelayToken by remember { mutableStateOf(repository.getWarpRelayToken()) }
 
     var showSubscriptionDialog by remember { mutableStateOf(false) }
+    var showAddFreeTurnDialog by remember { mutableStateOf(false) }
+    val captchaUrl by TunnelManager.captchaUrl.collectAsState()
     var isFetchingSubscription by remember { mutableStateOf(false) }
     var updatingSubscriptionUrls by remember { mutableStateOf<Set<String>>(emptySet()) }
     var subscriptionErrorMessage by remember { mutableStateOf<String?>(null) }
     var subscriptionUrl by remember { mutableStateOf(repository.getSubscriptionUrl() ?: "") }
     var subscriptions by remember { mutableStateOf(repository.getSubscriptions()) }
+    var protocolDelegations by remember { mutableStateOf(repository.getProtocolDelegations()) }
 
     val scope = rememberCoroutineScope()
 
@@ -207,18 +216,17 @@ fun MainScreen(
             val hasInterface = interfaceRegex.containsMatchIn(text)
 
             when {
-                // Subscription URL (if not inside an INI comment)
-                httpMatch != null && !hasInterface -> {
+                // Subscription URL (HTTP/HTTPS without proxy scheme or [Interface])
+                httpMatch != null && !hasInterface && !com.travonet.wireguard.parser.ProxyLinkParser.isProxyLink(text) -> {
                     val url = httpMatch.value.trim().trimEnd('.', ',', ';')
                     subscriptionUrl = url
                     Toast.makeText(context, "Загрузка подписки...", Toast.LENGTH_SHORT).show()
                     fetchSubscription(url)
                 }
-                // AmneziaWG vpn:// URL
-                vpnMatch != null && !hasInterface -> {
-                    val vpnUrl = vpnMatch.value.trim().trimEnd('.', ',', ';')
-                    val profile = WgConfigParser.parseProfile("Профиль из буфера", vpnUrl)
-                    if (profile.rawConfig.contains("[Interface]", ignoreCase = true)) {
+                // Any supported proxy link (VLESS, VMess, Trojan, Shadowsocks, TUIC, Hysteria 2, WireGuard, AmneziaWG)
+                com.travonet.wireguard.parser.ProxyLinkParser.isProxyLink(text) -> {
+                    val profile = com.travonet.wireguard.parser.ProxyLinkParser.parse(text, "Профиль из буфера")
+                    if (profile != null) {
                         repository.addOrUpdateProfile(profile)
                         profiles = repository.getProfiles()
                         selectedProfileId = profile.id
@@ -226,25 +234,10 @@ fun MainScreen(
                         scope.launch { pagerState.animateScrollToPage(0) }
                         Toast.makeText(context, "Импортировано: ${profile.name}", Toast.LENGTH_SHORT).show()
                     } else {
-                        Toast.makeText(context, "Не удалось разобрать ссылку vpn://", Toast.LENGTH_SHORT).show()
+                        Toast.makeText(context, "Не удалось разобрать прокси-ссылку", Toast.LENGTH_SHORT).show()
                     }
                 }
-                // WireGuard wireguard:// or wg:// URL
-                wgMatch != null && !hasInterface -> {
-                    val wgUrl = wgMatch.value.trim().trimEnd('.', ',', ';')
-                    val profile = WgConfigParser.parseProfile("Профиль из буфера", wgUrl)
-                    if (profile.rawConfig.contains("[Interface]", ignoreCase = true)) {
-                        repository.addOrUpdateProfile(profile)
-                        profiles = repository.getProfiles()
-                        selectedProfileId = profile.id
-                        repository.setSelectedProfileId(profile.id)
-                        scope.launch { pagerState.animateScrollToPage(0) }
-                        Toast.makeText(context, "Импортировано: ${profile.name}", Toast.LENGTH_SHORT).show()
-                    } else {
-                        Toast.makeText(context, "Не удалось разобрать ссылку WireGuard", Toast.LENGTH_SHORT).show()
-                    }
-                }
-                // WireGuard / AmneziaWG .conf configuration
+                // Standard WireGuard / AmneziaWG .conf configuration
                 hasInterface -> {
                     val profile = WgConfigParser.parseProfile("Профиль из буфера", text)
                     repository.addOrUpdateProfile(profile)
@@ -255,11 +248,22 @@ fun MainScreen(
                     Toast.makeText(context, "Импортировано: ${profile.name}", Toast.LENGTH_SHORT).show()
                 }
                 else -> {
-                    Toast.makeText(
-                        context,
-                        "Буфер не содержит конфигурацию ([Interface]), ссылку (vpn://, wireguard://) или URL подписки",
-                        Toast.LENGTH_LONG
-                    ).show()
+                    // Try parsing as multi-line subscription/profile list
+                    val parsedList = com.travonet.wireguard.subscription.SubscriptionFetcher.parseSubscriptionBody(text, "Буфер")
+                    if (parsedList.isNotEmpty()) {
+                        parsedList.forEach { repository.addOrUpdateProfile(it) }
+                        profiles = repository.getProfiles()
+                        selectedProfileId = parsedList.first().id
+                        repository.setSelectedProfileId(selectedProfileId)
+                        scope.launch { pagerState.animateScrollToPage(0) }
+                        Toast.makeText(context, "Импортировано профилей: ${parsedList.size}", Toast.LENGTH_SHORT).show()
+                    } else {
+                        Toast.makeText(
+                            context,
+                            "Буфер не содержит конфигурацию, прокси-ссылку или URL подписки",
+                            Toast.LENGTH_LONG
+                        ).show()
+                    }
                 }
             }
         } else {
@@ -369,7 +373,7 @@ fun MainScreen(
                     title = {
                         Row(verticalAlignment = androidx.compose.ui.Alignment.CenterVertically) {
                             Text(
-                                text = "TravonetWG",
+                                text = "TravonetVPN",
                                 fontWeight = FontWeight.Black,
                                 fontSize = 20.sp
                             )
@@ -393,6 +397,7 @@ fun MainScreen(
                             onGenerateWarp = { generateWarp() },
                             onCreateManual = { isAddingProfile = true },
                             onOpenSubscription = { showSubscriptionDialog = true },
+                            onOpenFreeTurn = { showAddFreeTurnDialog = true },
                             onUpdateSubscription = if (subscriptionUrl.isNotBlank()) {
                                 { fetchSubscription(subscriptionUrl) }
                             } else null
@@ -435,7 +440,21 @@ fun MainScreen(
                             Row(verticalAlignment = androidx.compose.ui.Alignment.CenterVertically) {
                                 Icon(Icons.Default.Bolt, contentDescription = null, modifier = Modifier.size(16.dp))
                                 Spacer(Modifier.width(6.dp))
-                                Text("Стратегии обхода", fontWeight = if (pagerState.currentPage == 1) FontWeight.Bold else FontWeight.Normal)
+                                Text("Стратегии", fontWeight = if (pagerState.currentPage == 1) FontWeight.Bold else FontWeight.Normal)
+                            }
+                        }
+                    )
+
+                    Tab(
+                        selected = pagerState.currentPage == 2,
+                        onClick = {
+                            scope.launch { pagerState.animateScrollToPage(2) }
+                        },
+                        text = {
+                            Row(verticalAlignment = androidx.compose.ui.Alignment.CenterVertically) {
+                                Icon(Icons.Default.Memory, contentDescription = null, modifier = Modifier.size(16.dp))
+                                Spacer(Modifier.width(6.dp))
+                                Text("Ядра", fontWeight = if (pagerState.currentPage == 2) FontWeight.Bold else FontWeight.Normal)
                             }
                         }
                     )
@@ -454,8 +473,20 @@ fun MainScreen(
                     val activeProf = profiles.firstOrNull { it.id == selectedProfileId }
                         ?: profiles.firstOrNull()
                     if (activeProf == null) {
-                        Toast.makeText(context, "Выберите конфигурацию WireGuard!", Toast.LENGTH_SHORT).show()
+                        Toast.makeText(context, "Выберите конфигурацию!", Toast.LENGTH_SHORT).show()
                         return@BottomControlBar
+                    }
+                    val routing = com.travonet.wireguard.core.CoreRouter.route(activeProf.rawConfig, protocolDelegations)
+                    if (routing.targetCore != com.travonet.wireguard.core.CoreType.TRAVONET_WG) {
+                        if (!com.travonet.wireguard.core.CoreManager.isInstalled(context, routing.targetCore)) {
+                            Toast.makeText(
+                                context,
+                                "Для запуска ${routing.detectedProtocol} необходимо установить ядро ${routing.targetCore.title} во вкладке «Ядра»",
+                                Toast.LENGTH_LONG
+                            ).show()
+                            scope.launch { pagerState.animateScrollToPage(2) }
+                            return@BottomControlBar
+                        }
                     }
                     onRequestStartTunnel(activeProf, activeFallbackStrategy, tunnelMode)
                 },
@@ -520,7 +551,8 @@ fun MainScreen(
                     },
                     onUpdateSpecificSubscription = { url -> fetchSubscription(url) },
                     updatingSubscriptionUrls = updatingSubscriptionUrls,
-                    isUpdatingSubscription = isFetchingSubscription
+                    isUpdatingSubscription = isFetchingSubscription,
+                    customDelegations = protocolDelegations
                 )
 
                 1 -> StrategiesScreen(
@@ -539,6 +571,11 @@ fun MainScreen(
                         strategies = repository.getStrategies()
                         selectedStrategyId = repository.getSelectedStrategyId()
                     }
+                )
+
+                2 -> CoresScreen(
+                    coreManager = coreManager,
+                    onDelegationsChanged = { protocolDelegations = it }
                 )
             }
         }
@@ -588,11 +625,11 @@ fun MainScreen(
 
         AlertDialog(
             onDismissRequest = { showInfoDialog = false },
-            title = { Text("О приложении TravonetWG") },
+            title = { Text("О приложении TravonetVPN") },
             text = {
                 Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     Text(
-                        text = "TravonetWG — клиент WireGuard со встроенной L3/L4 десинхронизацией пакетов для обхода глубокого анализа ТСПУ / DPI.",
+                        text = "TravonetVPN — универсальный клиент VPN и прокси со встроенной десинхронизацией пакетов для обхода глубокого анализа ТСПУ / DPI и поддержкой современных протоколов.",
                         style = MaterialTheme.typography.bodyMedium
                     )
                     HorizontalDivider()
@@ -682,6 +719,25 @@ fun MainScreen(
             errorMessage = subscriptionErrorMessage
         )
     }
+
+    if (showAddFreeTurnDialog) {
+        AddFreeTurnDialog(
+            onDismiss = { showAddFreeTurnDialog = false },
+            onSave = { newProf ->
+                repository.addOrUpdateProfile(newProf)
+                profiles = repository.getProfiles()
+                showAddFreeTurnDialog = false
+                Toast.makeText(context, "Профиль FreeTURN сохранен", Toast.LENGTH_SHORT).show()
+            }
+        )
+    }
+
+    if (captchaUrl != null) {
+        CaptchaDialog(
+            url = captchaUrl!!,
+            onDismiss = { TunnelManager.hideCaptcha() }
+        )
+    }
 }
 
 @Composable
@@ -691,6 +747,7 @@ private fun AddConfigMenuButton(
     onGenerateWarp: () -> Unit,
     onCreateManual: () -> Unit,
     onOpenSubscription: () -> Unit,
+    onOpenFreeTurn: () -> Unit,
     onUpdateSubscription: (() -> Unit)? = null
 ) {
     var expanded by remember { mutableStateOf(false) }
