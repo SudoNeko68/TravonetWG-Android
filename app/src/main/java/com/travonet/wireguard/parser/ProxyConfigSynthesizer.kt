@@ -66,6 +66,12 @@ object ProxyConfigSynthesizer {
                 }
                 if (type == requiredType) {
                     hasRequired = true
+                    if (type == "tun") {
+                        inObj.put("stack", "gvisor")
+                        inObj.put("mtu", 1420)
+                        inObj.put("auto_route", false)
+                        inObj.remove("sniff")
+                    }
                 }
                 newInbounds.put(inObj)
             }
@@ -87,8 +93,17 @@ object ProxyConfigSynthesizer {
                     val cleanOutbounds = JSONArray()
                     for (i in 0 until outbounds.length()) {
                         val outObj = outbounds.optJSONObject(i) ?: continue
-                        if (outObj.optString("type").equals("dns", ignoreCase = true)) {
+                        val outType = outObj.optString("type").lowercase()
+                        if (outType == "dns") {
                             continue
+                        }
+                        if (outType != "direct" && outType != "block") {
+                            if (!outObj.has("tcp_keep_alive_interval")) {
+                                outObj.put("tcp_keep_alive_interval", "15s")
+                            }
+                            if (!outObj.has("connect_timeout")) {
+                                outObj.put("connect_timeout", "10s")
+                            }
                         }
                         // Normalize Hysteria2 server_ports (must be JSONArray with start:end syntax)
                         if (outObj.optString("type").equals("hysteria2", ignoreCase = true)) {
@@ -123,31 +138,36 @@ object ProxyConfigSynthesizer {
                     root.put("outbounds", cleanOutbounds)
                 }
 
-                // 2. Migrate route.rules to modern action: "hijack-dns"
+                // 2. Rebuild route.rules: DNS hijack/direct rules MUST come first
                 val routeObj = root.optJSONObject("route")
                 if (routeObj != null) {
-                    val rules = routeObj.optJSONArray("rules")
-                    if (rules != null) {
-                        var hasDnsHijack = false
-                        for (i in 0 until rules.length()) {
-                            val rule = rules.optJSONObject(i) ?: continue
-                            val outbound = rule.optString("outbound")
-                            if (outbound.equals("dns", ignoreCase = true) || outbound.equals("dns-out", ignoreCase = true)) {
-                                rule.remove("outbound")
-                                rule.put("action", "hijack-dns")
-                                hasDnsHijack = true
-                            }
-                            if (rule.optString("action").equals("hijack-dns", ignoreCase = true)) {
-                                hasDnsHijack = true
-                            }
-                        }
-                        if (!hasDnsHijack && mode == TunnelMode.VPN && dnsMode != DnsMode.SYSTEM) {
-                            rules.put(0, JSONObject().apply {
-                                put("protocol", "dns")
-                                put("action", "hijack-dns")
-                            })
-                        }
+                    val existingRules = routeObj.optJSONArray("rules") ?: JSONArray()
+                    val orderedRules = JSONArray()
+
+                    if (mode == TunnelMode.VPN) {
+                        orderedRules.put(JSONObject().apply {
+                            put("port", JSONArray().put(53))
+                            put("action", "hijack-dns")
+                        })
+                        orderedRules.put(JSONObject().apply {
+                            put("protocol", "dns")
+                            put("action", "hijack-dns")
+                        })
                     }
+
+                    for (i in 0 until existingRules.length()) {
+                        val rule = existingRules.optJSONObject(i) ?: continue
+                        val action = rule.optString("action")
+                        val outbound = rule.optString("outbound")
+                        // Skip existing standalone DNS rules that we just prepended
+                        if (action.equals("hijack-dns", ignoreCase = true)) continue
+                        if (outbound.equals("dns", ignoreCase = true) || outbound.equals("dns-out", ignoreCase = true)) continue
+                        val portArr = rule.optJSONArray("port")
+                        if (portArr != null && portArr.length() == 1 && portArr.optInt(0) == 53 && (outbound == "direct" || action == "hijack-dns")) continue
+                        if (rule.optString("protocol") == "dns" && (outbound == "direct" || action == "hijack-dns")) continue
+                        orderedRules.put(rule)
+                    }
+                    routeObj.put("rules", orderedRules)
                 }
 
                 // 3. Install the app-wide DNS policy. The raw profile DNS is
@@ -172,21 +192,31 @@ object ProxyConfigSynthesizer {
 
     private fun buildSingboxDns(dnsMode: DnsMode, dohUrl: String): JSONObject {
         val servers = JSONArray()
-        val remoteUrl = when (dnsMode) {
-            DnsMode.SYSTEM -> null
-            DnsMode.SERVER -> "https://1.1.1.1/dns-query"
-            DnsMode.CUSTOM -> dohUrl.ifBlank { "https://1.1.1.1/dns-query" }
+        when (dnsMode) {
+            DnsMode.SYSTEM -> {
+                servers.put(createSingboxDnsServer("77.88.8.8", "direct-dns", ""))
+                servers.put(createSingboxDnsServer("8.8.8.8", "direct-dns-fallback", ""))
+                servers.put(createSingboxDnsServer("1.1.1.1", "direct-dns-cf", ""))
+            }
+            DnsMode.SERVER -> {
+                servers.put(createSingboxDnsServer("1.1.1.1", "remote-dns", "proxy"))
+                servers.put(createSingboxDnsServer("8.8.8.8", "remote-dns-fallback", "proxy"))
+                servers.put(createSingboxDnsServer("77.88.8.8", "direct-dns", ""))
+                servers.put(createSingboxDnsServer("8.8.8.8", "direct-dns-alt", ""))
+            }
+            DnsMode.CUSTOM -> {
+                val custom = dohUrl.trim().ifBlank { "1.1.1.1" }
+                servers.put(createSingboxDnsServer(custom, "remote-dns", "proxy"))
+                servers.put(createSingboxDnsServer("77.88.8.8", "direct-dns", ""))
+                servers.put(createSingboxDnsServer("8.8.8.8", "direct-dns-fallback", ""))
+                servers.put(createSingboxDnsServer("1.1.1.1", "direct-dns-cf", ""))
+            }
         }
-        if (remoteUrl != null && !remoteUrl.equals("local", ignoreCase = true)) {
-            servers.put(createSingboxDnsServer(remoteUrl, "remote-dns", "proxy"))
-        }
-        // Local resolver for the proxy server's own domain. It must have no
-        // detour: sing-box treats an explicit detour to an empty direct
-        // outbound as an error ("detour to an empty direct outbound...").
-        servers.put(createSingboxDnsServer("local", "direct-dns", ""))
         return JSONObject().apply {
             put("servers", servers)
             put("strategy", "prefer_ipv4")
+            put("independent_cache", true)
+            put("final", if (dnsMode != DnsMode.SYSTEM) "remote-dns" else "direct-dns")
         }
     }
 
@@ -203,8 +233,8 @@ object ProxyConfigSynthesizer {
 
         var directTag = findDirectDnsTag(servers)
         if (directTag == null) {
-            directTag = if (hasDnsServerTag(servers, "direct-dns")) "direct-dns-local" else "direct-dns"
-            servers.put(createSingboxDnsServer("local", directTag, ""))
+            directTag = if (hasDnsServerTag(servers, "direct-dns")) "direct-dns-fallback" else "direct-dns"
+            servers.put(createSingboxDnsServer("77.88.8.8", directTag, ""))
         }
 
         val route = root.optJSONObject("route")
@@ -231,23 +261,18 @@ object ProxyConfigSynthesizer {
     private fun findDirectDnsTag(servers: JSONArray): String? {
         for (i in 0 until servers.length()) {
             val sObj = servers.optJSONObject(i) ?: continue
-            val type = sObj.optString("type")
-            val address = sObj.optString("address")
-            if (type.equals("local", ignoreCase = true) || address.equals("local", ignoreCase = true)) {
-                val tag = sObj.optString("tag")
-                if (tag.isBlank()) {
-                    sObj.put("tag", "direct-dns")
-                    return "direct-dns"
-                }
-                return tag
+            val tag = sObj.optString("tag")
+            val detour = sObj.optString("detour")
+            if (tag == "direct-dns" || detour == "direct") {
+                return tag.ifBlank { "direct-dns" }
             }
         }
         for (i in 0 until servers.length()) {
             val sObj = servers.optJSONObject(i) ?: continue
-            if (sObj.optString("tag") == "direct-dns" &&
-                !sObj.optString("detour").equals("proxy", ignoreCase = true)
-            ) {
-                return "direct-dns"
+            val tag = sObj.optString("tag")
+            val detour = sObj.optString("detour")
+            if (detour.isEmpty() || detour == "direct") {
+                if (tag.isNotBlank()) return tag
             }
         }
         return null
@@ -277,9 +302,10 @@ object ProxyConfigSynthesizer {
                 put("address", JSONArray().apply {
                     put("172.19.0.1/30")
                 })
+                put("mtu", 1420)
                 put("auto_route", false)
                 put("strict_route", false)
-                put("stack", "mixed")
+                put("stack", "gvisor")
             }
         }
     }
@@ -323,7 +349,8 @@ object ProxyConfigSynthesizer {
         mode: TunnelMode,
         socksListen: String = "127.0.0.1:1080",
         dnsMode: DnsMode = DnsMode.CUSTOM,
-        customHosts: String = ""
+        customHosts: String = "",
+        dohUrl: String = "https://1.1.1.1/dns-query"
     ): String {
         if (!root.has("inbounds")) {
             root.put("inbounds", createXrayInbound(mode, socksListen))
@@ -337,17 +364,37 @@ object ProxyConfigSynthesizer {
             put("protocol", "freedom")
             put("settings", JSONObject())
         }
+        val streamSettings = proxyOutbound.optJSONObject("streamSettings") ?: JSONObject().also { proxyOutbound.put("streamSettings", it) }
+        val sockopt = streamSettings.optJSONObject("sockopt") ?: JSONObject().also { streamSettings.put("sockopt", it) }
+        if (!sockopt.has("tcpKeepAliveInterval")) {
+            sockopt.put("tcpKeepAliveInterval", 15)
+        }
+        if (!sockopt.has("tcpKeepAliveIdle")) {
+            sockopt.put("tcpKeepAliveIdle", 15)
+        }
         root.put("outbounds", JSONArray().put(proxyOutbound).put(directOutbound))
 
         val inboundTag = if (mode == TunnelMode.SOCKS5) "socks-in" else "tun-in"
+        val dnsOutbound = JSONObject().apply {
+            put("tag", "dns-out")
+            put("protocol", "dns")
+            put("settings", JSONObject())
+        }
+        root.put("outbounds", JSONArray().put(proxyOutbound).put(directOutbound).put(dnsOutbound))
+
         root.put("routing", JSONObject().apply {
             put("domainStrategy", if (dnsMode == DnsMode.SYSTEM) "UseIP" else "AsIs")
             val rules = JSONArray().apply {
-                if (dnsMode == DnsMode.SYSTEM) {
+                if (mode == TunnelMode.VPN) {
                     put(JSONObject().apply {
                         put("type", "field")
                         put("port", "53")
-                        put("outboundTag", "direct")
+                        put("outboundTag", "dns-out")
+                    })
+                    put(JSONObject().apply {
+                        put("type", "field")
+                        put("protocol", JSONArray().put("dns"))
+                        put("outboundTag", "dns-out")
                     })
                 }
                 put(JSONObject().apply {
@@ -358,6 +405,25 @@ object ProxyConfigSynthesizer {
             }
             put("rules", rules)
         })
+
+        val dnsObj = root.optJSONObject("dns") ?: JSONObject().also { root.put("dns", it) }
+        val servers = JSONArray()
+        when (dnsMode) {
+            DnsMode.SYSTEM -> {
+                servers.put("localhost")
+                servers.put("77.88.8.8")
+            }
+            DnsMode.SERVER -> {
+                servers.put("1.1.1.1")
+                servers.put("8.8.8.8")
+            }
+            DnsMode.CUSTOM -> {
+                if (dohUrl.isNotBlank() && !dohUrl.equals("local", ignoreCase = true)) servers.put(dohUrl)
+                servers.put("1.1.1.1")
+                servers.put("8.8.8.8")
+            }
+        }
+        dnsObj.put("servers", servers)
 
         applyCustomHostsToXray(root, customHosts)
         return root.toString(2)
@@ -381,6 +447,15 @@ object ProxyConfigSynthesizer {
             })
         }
 
+        val outType = proxyOutbound.optString("type").lowercase()
+        if (outType != "direct" && outType != "block" && outType != "dns") {
+            if (!proxyOutbound.has("tcp_keep_alive_interval")) {
+                proxyOutbound.put("tcp_keep_alive_interval", "15s")
+            }
+            if (!proxyOutbound.has("connect_timeout")) {
+                proxyOutbound.put("connect_timeout", "10s")
+            }
+        }
         val directOutbound = JSONObject().apply {
             put("type", "direct")
             put("tag", "direct")
@@ -396,14 +471,16 @@ object ProxyConfigSynthesizer {
                 put("auto_detect_interface", false)
                 val rules = JSONArray().apply {
                     put(JSONObject().apply {
+                        put("port", JSONArray().put(53))
+                        put("action", "hijack-dns")
+                    })
+                    put(JSONObject().apply {
+                        put("protocol", "dns")
+                        put("action", "hijack-dns")
+                    })
+                    put(JSONObject().apply {
                         put("action", "sniff")
                     })
-                    if (dnsMode != DnsMode.SYSTEM) {
-                        put(JSONObject().apply {
-                            put("protocol", "dns")
-                            put("action", "hijack-dns")
-                        })
-                    }
                     put(JSONObject().apply {
                         put("inbound", inboundTag)
                         put("outbound", "proxy")
@@ -681,7 +758,7 @@ object ProxyConfigSynthesizer {
                 put("streamSettings", streamSettings)
             }
 
-            completeXrayConfig(root, vlessOutbound, mode, socksListen, dnsMode, customHosts)
+            completeXrayConfig(root, vlessOutbound, mode, socksListen, dnsMode, customHosts, dohUrl)
         } else {
             // Sing-box configuration
             val root = JSONObject()
@@ -807,7 +884,7 @@ object ProxyConfigSynthesizer {
                 }
                 put("streamSettings", streamSettings)
             }
-            completeXrayConfig(root, vmessOutbound, mode, socksListen, dnsMode, customHosts)
+            completeXrayConfig(root, vmessOutbound, mode, socksListen, dnsMode, customHosts, dohUrl)
         } else {
             root.put("log", JSONObject().put("level", "warn"))
             root.put("inbounds", JSONArray().put(createSingboxInbound(mode, socksListen)))
@@ -874,7 +951,7 @@ object ProxyConfigSynthesizer {
                     put("tlsSettings", JSONObject().put("serverName", sni))
                 })
             }
-            completeXrayConfig(root, trojanOutbound, mode, socksListen, dnsMode, customHosts)
+            completeXrayConfig(root, trojanOutbound, mode, socksListen, dnsMode, customHosts, dohUrl)
         } else {
             root.put("log", JSONObject().put("level", "warn"))
             root.put("inbounds", JSONArray().put(createSingboxInbound(mode, socksListen)))
@@ -955,7 +1032,7 @@ object ProxyConfigSynthesizer {
                     }))
                 })
             }
-            completeXrayConfig(root, ssOutbound, mode, socksListen, dnsMode, customHosts)
+            completeXrayConfig(root, ssOutbound, mode, socksListen, dnsMode, customHosts, dohUrl)
         } else {
             root.put("log", JSONObject().put("level", "warn"))
             root.put("inbounds", JSONArray().put(createSingboxInbound(mode, socksListen)))
@@ -1360,7 +1437,7 @@ object ProxyConfigSynthesizer {
     private fun createSingboxDnsServer(urlOrIp: String, tag: String, detour: String): JSONObject {
         val serverObj = JSONObject().apply {
             put("tag", tag)
-            if (detour.isNotBlank()) put("detour", detour)
+            if (detour.isNotBlank() && detour != "direct") put("detour", detour)
         }
         val clean = urlOrIp.trim()
         when {

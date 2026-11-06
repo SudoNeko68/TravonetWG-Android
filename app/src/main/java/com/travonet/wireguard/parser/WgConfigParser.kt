@@ -417,6 +417,56 @@ object WgConfigParser {
     }
 
     /**
+     * Гарантирует наличие PersistentKeepalive = 25 для каждого [Peer].
+     * Без keepalive мобильные операторы и роутеры сбрасывают UDP NAT-сессию
+     * через 20-30 секунд простоя, из-за чего входящий и фоновый трафик перестаёт поступать.
+     */
+    fun ensurePersistentKeepalive(rawConfig: String, defaultInterval: Int = 25): String {
+        val lines = rawConfig.lines()
+        val result = mutableListOf<String>()
+        var inPeer = false
+        var peerHasKeepalive = false
+
+        fun finalizePeer() {
+            if (inPeer && !peerHasKeepalive) {
+                result.add("PersistentKeepalive = $defaultInterval")
+            }
+        }
+
+        for (line in lines) {
+            val trimmed = line.trim()
+            if (trimmed.startsWith("[") && trimmed.endsWith("]")) {
+                val sec = trimmed.substring(1, trimmed.length - 1).trim().lowercase()
+                finalizePeer()
+                inPeer = (sec == "peer")
+                peerHasKeepalive = false
+                result.add(line)
+                continue
+            }
+
+            if (inPeer && trimmed.contains("=")) {
+                val key = trimmed.substringBefore('=').trim().lowercase()
+                val value = trimmed.substringAfter('=').substringBefore('#').substringBefore(';').trim().toIntOrNull()
+                if (key == "persistentkeepalive") {
+                    if (value != null && value > 0) {
+                        peerHasKeepalive = true
+                        result.add(line)
+                    } else {
+                        peerHasKeepalive = true
+                        result.add("PersistentKeepalive = $defaultInterval")
+                    }
+                    continue
+                }
+            }
+
+            result.add(line)
+        }
+
+        finalizePeer()
+        return result.joinToString("\n")
+    }
+
+    /**
      * Преобразует доменные имена в Endpoint директивах пиров в IPv4-адреса.
      *
      * Как только Android VpnService выполняет establish(), весь системный DNS

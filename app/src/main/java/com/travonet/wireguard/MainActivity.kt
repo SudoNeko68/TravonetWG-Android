@@ -2,11 +2,15 @@ package com.travonet.wireguard
 
 import android.Manifest
 import android.app.Activity
+import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.net.Uri
 import android.net.VpnService
 import android.os.Build
 import android.os.Bundle
+import android.os.PowerManager
+import android.provider.Settings
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -95,6 +99,7 @@ class MainActivity : ComponentActivity() {
                         // actually starts a foreground tunnel, not on every
                         // cold app start.
                         checkNotificationPermission()
+                        checkBatteryOptimization()
                         withLocalNetworkPermission {
                             when (mode) {
                                 TunnelMode.VPN -> {
@@ -132,6 +137,25 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    private fun checkBatteryOptimization() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            val pm = getSystemService(Context.POWER_SERVICE) as? PowerManager
+            if (pm != null && !pm.isIgnoringBatteryOptimizations(packageName)) {
+                try {
+                    val intent = Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS).apply {
+                        data = Uri.parse("package:$packageName")
+                    }
+                    startActivity(intent)
+                } catch (_: Exception) {}
+            }
+        }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        TunnelManager.queryTunnelState(this)
+    }
+
     override fun onDestroy() {
         super.onDestroy()
         uiReceiver?.let {
@@ -140,12 +164,5 @@ class MainActivity : ComponentActivity() {
             } catch (_: Exception) {}
         }
         uiReceiver = null
-    }
-
-    override fun onTrimMemory(level: Int) {
-        super.onTrimMemory(level)
-        if (level >= TRIM_MEMORY_UI_HIDDEN) {
-            System.gc()
-        }
     }
 }

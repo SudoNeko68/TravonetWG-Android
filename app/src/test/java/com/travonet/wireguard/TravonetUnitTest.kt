@@ -1050,6 +1050,162 @@ class TravonetUnitTest {
         assertEquals("127.0.0.1:1080", ftSocksJson.getJSONObject("proxy").getString("listen"))
         assertEquals("none", ftSocksJson.getJSONObject("tunnel").getString("mode"))
     }
+
+    @Test
+    fun testSingboxGvisorStackAndDnsRoutingModes() {
+        val vlessLink = "vless://b831381d-6324-4d53-ad4f-8cda48b30811@1.2.3.4:443?encryption=none&security=reality&type=tcp&sni=yahoo.com&fp=chrome&pbk=12345&sid=abcd#TestVless"
+
+        // 1. Sing-box VPN uses gvisor stack (not mixed which causes SELinux netlink crash)
+        val singboxVpn = org.json.JSONObject(
+            com.travonet.wireguard.parser.ProxyConfigSynthesizer.synthesize(
+                rawConfig = vlessLink,
+                targetCore = com.travonet.wireguard.core.CoreType.SINGBOX,
+                mode = com.travonet.wireguard.model.TunnelMode.VPN,
+                dnsMode = com.travonet.wireguard.model.DnsMode.SERVER
+            )
+        )
+        val tunObj = singboxVpn.getJSONArray("inbounds").getJSONObject(0)
+        assertEquals("gvisor", tunObj.getString("stack"))
+
+        // direct-dns is an explicit IP (not "local" which fails on Android)
+        val dnsServers = singboxVpn.getJSONObject("dns").getJSONArray("servers")
+        var directDnsFound = false
+        for (i in 0 until dnsServers.length()) {
+            val s = dnsServers.getJSONObject(i)
+            if (s.optString("tag") == "direct-dns") {
+                assertFalse(s.has("detour"))
+                assertNotEquals("local", s.optString("type"))
+                directDnsFound = true
+            }
+        }
+        assertTrue(directDnsFound)
+
+        // 2. DnsMode.SERVER / CUSTOM: route rules hijack DNS
+        val serverRules = singboxVpn.getJSONObject("route").getJSONArray("rules")
+        var hasHijack = false
+        for (i in 0 until serverRules.length()) {
+            val r = serverRules.getJSONObject(i)
+            if (r.optString("action") == "hijack-dns") {
+                hasHijack = true
+            }
+        }
+        assertTrue("DnsMode.SERVER must have hijack-dns rule", hasHijack)
+
+        // 3. DnsMode.SYSTEM: route rules hijack DNS, but final resolver is direct-dns
+        val singboxSystem = org.json.JSONObject(
+            com.travonet.wireguard.parser.ProxyConfigSynthesizer.synthesize(
+                rawConfig = vlessLink,
+                targetCore = com.travonet.wireguard.core.CoreType.SINGBOX,
+                mode = com.travonet.wireguard.model.TunnelMode.VPN,
+                dnsMode = com.travonet.wireguard.model.DnsMode.SYSTEM
+            )
+        )
+        assertEquals("direct-dns", singboxSystem.getJSONObject("dns").getString("final"))
+        val sysRules = singboxSystem.getJSONObject("route").getJSONArray("rules")
+        var hasSystemHijack = false
+        for (i in 0 until sysRules.length()) {
+            val r = sysRules.getJSONObject(i)
+            if (r.optString("action") == "hijack-dns") {
+                hasSystemHijack = true
+            }
+        }
+        assertTrue("DnsMode.SYSTEM must have hijack-dns rule to prevent ISP drops", hasSystemHijack)
+    }
+
+    @Test
+    fun testXrayDnsConfiguration() {
+        val vlessLink = "vless://b831381d-6324-4d53-ad4f-8cda48b30811@1.2.3.4:443?encryption=none&security=reality&type=tcp&sni=yahoo.com&fp=chrome&pbk=12345&sid=abcd#TestVless"
+
+        val xrayConfig = org.json.JSONObject(
+            com.travonet.wireguard.parser.ProxyConfigSynthesizer.synthesize(
+                rawConfig = vlessLink,
+                targetCore = com.travonet.wireguard.core.CoreType.XRAY,
+                mode = com.travonet.wireguard.model.TunnelMode.VPN,
+                dnsMode = com.travonet.wireguard.model.DnsMode.CUSTOM,
+                dohUrl = "https://dns.quad9.net/dns-query"
+            )
+        )
+        assertTrue(xrayConfig.has("dns"))
+        val servers = xrayConfig.getJSONObject("dns").getJSONArray("servers")
+        var hasQuad9 = false
+        for (i in 0 until servers.length()) {
+            if (servers.getString(i).contains("dns.quad9.net")) hasQuad9 = true
+        }
+        assertTrue(hasQuad9)
+    }
+
+    @Test
+    fun testEnsurePersistentKeepalive() {
+        val rawNoKeepalive = """
+            [Interface]
+            PrivateKey = aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+            Address = 10.0.0.2/32
+
+            [Peer]
+            PublicKey = bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+            Endpoint = 1.2.3.4:51820
+            AllowedIPs = 0.0.0.0/0
+        """.trimIndent()
+
+        val withKeepalive = WgConfigParser.ensurePersistentKeepalive(rawNoKeepalive, 25)
+        assertTrue(withKeepalive.contains("PersistentKeepalive = 25"))
+
+        // Multiple peers and existing keepalive preservation
+        val rawMultiPeer = """
+            [Interface]
+            PrivateKey = aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+            Address = 10.0.0.2/32
+
+            [Peer]
+            PublicKey = bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+            Endpoint = 1.2.3.4:51820
+            AllowedIPs = 0.0.0.0/0
+            PersistentKeepalive = 15
+
+            [Peer]
+            PublicKey = cccccccccccccccccccccccccccccccccccccccc
+            Endpoint = 5.6.7.8:51820
+            AllowedIPs = 10.0.1.0/24
+        """.trimIndent()
+
+        val multiResult = WgConfigParser.ensurePersistentKeepalive(rawMultiPeer, 25)
+        assertTrue(multiResult.contains("PersistentKeepalive = 15"))
+        assertTrue(multiResult.contains("PersistentKeepalive = 25"))
+    }
+
+    @Test
+    fun testProxyConfigKeepAliveAndTunMtu() {
+        val vlessLink = "vless://b831381d-6324-4d53-ad4f-8cda48b30811@1.2.3.4:443?encryption=none&security=reality&type=tcp&sni=yahoo.com&fp=chrome&pbk=12345&sid=abcd#TestVless"
+
+        val singboxVpn = org.json.JSONObject(
+            com.travonet.wireguard.parser.ProxyConfigSynthesizer.synthesize(
+                rawConfig = vlessLink,
+                targetCore = com.travonet.wireguard.core.CoreType.SINGBOX,
+                mode = com.travonet.wireguard.model.TunnelMode.VPN
+            )
+        )
+
+        // Check TUN MTU
+        val tunInbound = singboxVpn.getJSONArray("inbounds").getJSONObject(0)
+        assertEquals("tun", tunInbound.getString("type"))
+        assertEquals(1420, tunInbound.getInt("mtu"))
+
+        // Check proxy outbound keepalive
+        val proxyOutbound = singboxVpn.getJSONArray("outbounds").getJSONObject(0)
+        assertEquals("15s", proxyOutbound.getString("tcp_keep_alive_interval"))
+        assertEquals("10s", proxyOutbound.getString("connect_timeout"))
+
+        // Check DNS resilience (Yandex direct fallback & independent cache)
+        val dnsObj = singboxVpn.getJSONObject("dns")
+        assertTrue(dnsObj.getBoolean("independent_cache"))
+        val dnsServers = dnsObj.getJSONArray("servers")
+        var hasYandexFallback = false
+        for (i in 0 until dnsServers.length()) {
+            val s = dnsServers.getJSONObject(i)
+            if (s.optString("server") == "77.88.8.8") hasYandexFallback = true
+        }
+        assertTrue("direct DNS should contain Yandex fallback for RU resilience", hasYandexFallback)
+    }
 }
 
 

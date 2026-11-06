@@ -56,6 +56,7 @@ class TravonetVpnService : VpnService() {
     @Volatile private var destroyed = false
     @Volatile private var isProxyActive = false
     private var wakeLock: PowerManager.WakeLock? = null
+    private var wifiLock: android.net.wifi.WifiManager.WifiLock? = null
     private val repository by lazy { AppRepository(this) }
 
     companion object {
@@ -148,7 +149,8 @@ class TravonetVpnService : VpnService() {
 
             val parsed = WgConfigParser.parse(profile.rawConfig)
             val preparedConfig = WgConfigParser.prepareConfigForLaunch(profile, strategy)
-            val resolvedConfig = WgConfigParser.resolveConfigEndpoints(preparedConfig)
+            val keepaliveConfig = WgConfigParser.ensurePersistentKeepalive(preparedConfig)
+            val resolvedConfig = WgConfigParser.resolveConfigEndpoints(keepaliveConfig)
 
             val builder = Builder()
                 .setSession("TravonetVPN - ${profile.name}")
@@ -233,7 +235,7 @@ class TravonetVpnService : VpnService() {
                     val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
                     val lp = cm?.getLinkProperties(cm?.activeNetwork)
                     val sysList = lp?.dnsServers?.mapNotNull { it.hostAddress } ?: emptyList()
-                    sysList.ifEmpty { profileDns.ifEmpty { listOf("1.1.1.1", "8.8.8.8") } }
+                    sysList.ifEmpty { profileDns.ifEmpty { listOf("77.88.8.8", "8.8.8.8", "1.1.1.1") } }
                 }
                 DnsMode.SERVER -> profileDns.ifEmpty { listOf("1.1.1.1", "1.0.0.1") }
                 DnsMode.CUSTOM -> effectiveDns.ifEmpty { profileDns.ifEmpty { listOf("1.1.1.1", "1.0.0.1") } }
@@ -456,13 +458,13 @@ class TravonetVpnService : VpnService() {
                 // 3. Handshake не обновлялся более 180 секунд (Reject-After-Time в WireGuard).
                 // Если телефон в режиме ожидания (нет отправки пакетов), WireGuard намеренно
                 // не производит handshake (тишина в эфире) — туннель не должен разрываться.
-                val hasOutgoingTraffic = prevTxBytes >= 0L && stats.txBytes > prevTxBytes
+                val hasOutgoingTraffic = prevTxBytes >= 0L && (stats.txBytes - prevTxBytes) > 500L
                 val noIncomingTraffic = prevRxBytes >= 0L && stats.rxBytes == prevRxBytes
-                val isHandshakeStale = stats.lastHandshakeSec > 0L && (nowSec - stats.lastHandshakeSec) > 180
+                val isHandshakeStale = stats.lastHandshakeSec > 0L && (nowSec - stats.lastHandshakeSec) > 40
 
                 if (hasOutgoingTraffic && noIncomingTraffic && isHandshakeStale) {
                     staleCount++
-                    if (staleCount >= 4) { // 20 секунд подтвержденного отсутствия ответа при отправке
+                    if (staleCount >= 3) { // 15 секунд подтвержденного отсутствия ответа при отправке
                         Log.w(TAG, "Connection lost (outgoing traffic without response for ${nowSec - stats.lastHandshakeSec}s); auto-reconnecting...")
                         TunnelManager.updateState(TunnelStatus.CONNECTING, "Восстановление соединения...")
                         tunnelMutex.withLock {
@@ -600,7 +602,21 @@ class TravonetVpnService : VpnService() {
                 }
             }
 
-            parsed?.iface?.dnsServers?.forEach { dnsStr ->
+            val proxyDnsMode = repository.getDnsMode()
+            val proxyEffectiveDns = repository.getEffectiveDnsServers()
+            val proxyProfileDns = parsed?.iface?.dnsServers ?: emptyList()
+            val proxyDnsServers = when (proxyDnsMode) {
+                DnsMode.SYSTEM -> {
+                    val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
+                    val lp = cm?.getLinkProperties(cm?.activeNetwork)
+                    val sysList = lp?.dnsServers?.mapNotNull { it.hostAddress } ?: emptyList()
+                    sysList.ifEmpty { proxyProfileDns.ifEmpty { listOf("77.88.8.8", "8.8.8.8", "1.1.1.1") } }
+                }
+                DnsMode.SERVER -> proxyProfileDns.ifEmpty { listOf("1.1.1.1", "1.0.0.1") }
+                DnsMode.CUSTOM -> proxyEffectiveDns.ifEmpty { proxyProfileDns.ifEmpty { listOf("1.1.1.1", "1.0.0.1") } }
+            }
+
+            proxyDnsServers.forEach { dnsStr ->
                 try {
                     val dns = dnsStr.trim()
                     val isV6 = dns.contains(":")
@@ -611,10 +627,6 @@ class TravonetVpnService : VpnService() {
                 } catch (e: Exception) {
                     Log.w(TAG, "Failed to parse DNS: $dnsStr", e)
                 }
-            }
-            if (parsed == null || parsed.iface.dnsServers.isEmpty()) {
-                builder.addDnsServer("1.1.1.1")
-                builder.addDnsServer("1.0.0.1")
             }
 
             try {
@@ -680,11 +692,7 @@ class TravonetVpnService : VpnService() {
 
         val repository = AppRepository(this@TravonetVpnService)
         if (repository.isWakeLockEnabled()) acquireWakeLock() else releaseWakeLock()
-        if (repository.isForegroundServiceEnabled()) {
-            startForegroundServiceNotification(profile.name, activeDesc, "Подключено")
-        } else {
-            stopForeground(STOP_FOREGROUND_REMOVE)
-        }
+        startForegroundServiceNotification(profile.name, activeDesc, "Подключено")
         startProxyWatchdog(profile.name, "FreeTURN")
     }
 
@@ -750,10 +758,14 @@ class TravonetVpnService : VpnService() {
                 val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
                 val lp = cm?.getLinkProperties(cm?.activeNetwork)
                 val sysList = lp?.dnsServers?.mapNotNull { it.hostAddress } ?: emptyList()
-                sysList.ifEmpty { listOf("1.1.1.1", "8.8.8.8") }
+                val filtered = sysList.filter { !it.contains(":") }
+                if (filtered.isNotEmpty()) listOf("172.19.0.2") + filtered else listOf("172.19.0.2", "77.88.8.8", "1.1.1.1")
             }
-            DnsMode.SERVER -> listOf("1.1.1.1", "1.0.0.1")
-            DnsMode.CUSTOM -> effectiveDns.ifEmpty { listOf("1.1.1.1", "1.0.0.1") }
+            DnsMode.SERVER -> listOf("172.19.0.2", "1.1.1.1", "8.8.8.8")
+            DnsMode.CUSTOM -> {
+                val custom = effectiveDns.filter { !it.contains(":") }
+                if (custom.isNotEmpty()) listOf("172.19.0.2") + custom else listOf("172.19.0.2", "1.1.1.1")
+            }
         }
         builderDns.forEach { dns: String -> try { builder.addDnsServer(dns) } catch (_: Exception) {} }
 
@@ -1016,6 +1028,11 @@ class TravonetVpnService : VpnService() {
         }
     }
 
+    override fun onTaskRemoved(rootIntent: Intent?) {
+        super.onTaskRemoved(rootIntent)
+        Log.d(TAG, "onTaskRemoved: app task removed from recents, keeping VPN active")
+    }
+
     override fun onDestroy() {
         destroyed = true
         startJob?.cancel()
@@ -1029,58 +1046,55 @@ class TravonetVpnService : VpnService() {
         super.onDestroy()
     }
 
-    private fun updateUnderlyingNetworks() {
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.P) return
-        val cm = connectivityManager ?: (getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager) ?: return
+    private fun registerNetworkCallback() {
+        if (defaultNetworkCallback != null) return
+        val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager ?: return
+        connectivityManager = cm
+        val callback = object : ConnectivityManager.NetworkCallback() {
+            override fun onAvailable(network: Network) {
+                updateUnderlyingNetwork()
+            }
+
+            override fun onLost(network: Network) {
+                updateUnderlyingNetwork()
+            }
+
+            override fun onCapabilitiesChanged(network: Network, networkCapabilities: NetworkCapabilities) {
+                // Ignore transient RSSI / bandwidth capability changes to avoid flapping
+            }
+        }
         try {
-            val physicalNetworks = cm.allNetworks.filter { net ->
-                val caps = cm.getNetworkCapabilities(net)
-                caps != null &&
-                        caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) &&
-                        caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN)
-            }
-            if (physicalNetworks.isNotEmpty()) {
-                setUnderlyingNetworks(physicalNetworks.toTypedArray())
-            } else {
-                setUnderlyingNetworks(null)
-            }
+            val request = NetworkRequest.Builder()
+                .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+                .addCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN)
+                .build()
+            cm.registerNetworkCallback(request, callback)
+            defaultNetworkCallback = callback
+            updateUnderlyingNetwork()
         } catch (e: Exception) {
-            Log.w(TAG, "Failed to update underlying networks", e)
+            Log.w(TAG, "Failed to register network callback", e)
             try { setUnderlyingNetworks(null) } catch (_: Exception) {}
         }
     }
 
-    private fun registerNetworkCallback() {
-        if (defaultNetworkCallback != null) {
-            updateUnderlyingNetworks()
-            return
-        }
-        val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager ?: return
-        connectivityManager = cm
-        val request = NetworkRequest.Builder()
-            .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
-            .addCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN)
-            .build()
-        val callback = object : ConnectivityManager.NetworkCallback() {
-            override fun onAvailable(network: Network) {
-                updateUnderlyingNetworks()
-            }
-
-            override fun onLost(network: Network) {
-                updateUnderlyingNetworks()
-            }
-
-            override fun onCapabilitiesChanged(network: Network, networkCapabilities: NetworkCapabilities) {
-                updateUnderlyingNetworks()
-            }
-        }
+    private fun updateUnderlyingNetwork() {
         try {
-            cm.registerNetworkCallback(request, callback)
-            defaultNetworkCallback = callback
+            val cm = connectivityManager ?: return
+            val activeNet = cm.activeNetwork
+            if (activeNet != null) {
+                val caps = cm.getNetworkCapabilities(activeNet)
+                if (caps != null && caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN)) {
+                    Log.d(TAG, "Setting active physical underlying network: $activeNet")
+                    setUnderlyingNetworks(arrayOf(activeNet))
+                    return
+                }
+            }
+            Log.d(TAG, "Resetting underlying network to auto (null)")
+            setUnderlyingNetworks(null)
         } catch (e: Exception) {
-            Log.w(TAG, "Failed to register network callback", e)
+            Log.w(TAG, "Failed to update underlying networks", e)
+            try { setUnderlyingNetworks(null) } catch (_: Exception) {}
         }
-        updateUnderlyingNetworks()
     }
 
     private fun unregisterNetworkCallback() {
@@ -1095,16 +1109,34 @@ class TravonetVpnService : VpnService() {
     }
 
     private fun acquireWakeLock() {
-        if (wakeLock?.isHeld == true) return
-        try {
-            val powerManager = getSystemService(Context.POWER_SERVICE) as? PowerManager
-            wakeLock = powerManager?.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "TravonetVPN::VpnWakeLock")?.apply {
-                setReferenceCounted(false)
-                acquire(12 * 60 * 60 * 1000L) // 12 hours max safety timeout
+        if (wakeLock?.isHeld != true) {
+            try {
+                val powerManager = getSystemService(Context.POWER_SERVICE) as? PowerManager
+                wakeLock = powerManager?.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "TravonetVPN::VpnWakeLock")?.apply {
+                    setReferenceCounted(false)
+                    acquire(12 * 60 * 60 * 1000L) // 12 hours max safety timeout
+                }
+                Log.d(TAG, "WakeLock acquired")
+            } catch (e: Exception) {
+                Log.w(TAG, "Failed to acquire wake lock", e)
             }
-            Log.d(TAG, "WakeLock acquired")
-        } catch (e: Exception) {
-            Log.w(TAG, "Failed to acquire wake lock", e)
+        }
+        if (wifiLock?.isHeld != true) {
+            try {
+                val wifiManager = applicationContext.getSystemService(Context.WIFI_SERVICE) as? android.net.wifi.WifiManager
+                val mode = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    android.net.wifi.WifiManager.WIFI_MODE_FULL_LOW_LATENCY
+                } else {
+                    android.net.wifi.WifiManager.WIFI_MODE_FULL_HIGH_PERF
+                }
+                wifiLock = wifiManager?.createWifiLock(mode, "TravonetVPN::VpnWifiLock")?.apply {
+                    setReferenceCounted(false)
+                    acquire()
+                }
+                Log.d(TAG, "WifiLock acquired")
+            } catch (e: Exception) {
+                Log.w(TAG, "Failed to acquire wifi lock", e)
+            }
         }
     }
 
@@ -1118,6 +1150,16 @@ class TravonetVpnService : VpnService() {
             Log.w(TAG, "Failed to release wake lock", e)
         } finally {
             wakeLock = null
+        }
+        try {
+            if (wifiLock?.isHeld == true) {
+                wifiLock?.release()
+                Log.d(TAG, "WifiLock released")
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to release wifi lock", e)
+        } finally {
+            wifiLock = null
         }
     }
 
@@ -1177,5 +1219,14 @@ class TravonetVpnService : VpnService() {
             .addAction(android.R.drawable.ic_menu_close_clear_cancel, "Отключить", stopPendingIntent)
             .setPriority(NotificationCompat.PRIORITY_LOW)
             .build()
+    }
+
+    private fun isPrivateIp(ip: String): Boolean {
+        if (ip.startsWith("10.") || ip.startsWith("192.168.") || ip.startsWith("127.") || ip.startsWith("169.254.")) return true
+        if (ip.startsWith("172.")) {
+            val second = ip.split(".").getOrNull(1)?.toIntOrNull() ?: 0
+            if (second in 16..31) return true
+        }
+        return false
     }
 }

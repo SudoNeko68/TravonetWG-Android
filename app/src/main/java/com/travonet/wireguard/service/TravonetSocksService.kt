@@ -10,6 +10,7 @@ import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.os.Build
 import android.os.IBinder
+import android.os.PowerManager
 import android.util.Log
 import androidx.core.app.NotificationCompat
 import com.freevpn.coreloader.NativeCoreBridge
@@ -38,6 +39,8 @@ class TravonetSocksService : Service() {
     private var startJob: Job? = null
     private var statsJob: Job? = null
     private var isProxyActive = false
+    private var wakeLock: PowerManager.WakeLock? = null
+    private var wifiLock: android.net.wifi.WifiManager.WifiLock? = null
     private val repository by lazy { AppRepository(this) }
 
     companion object {
@@ -127,7 +130,8 @@ class TravonetSocksService : Service() {
                 if (routing.targetCore == CoreType.TRAVONET_WG) {
                     Log.i(TAG, "Launching via TravonetWG GoBackend")
                     val preparedConfig = WgConfigParser.prepareConfigForLaunch(profile, strategy)
-                    val handle = GoBackend.wgStartSocks5(listenAddr, preparedConfig)
+                    val keepaliveConfig = WgConfigParser.ensurePersistentKeepalive(preparedConfig)
+                    val handle = GoBackend.wgStartSocks5(listenAddr, keepaliveConfig)
                     if (handle < 0) {
                         TunnelManager.updateState(TunnelStatus.ERROR, "Ошибка запуска SOCKS5 прокси (Код: $handle)")
                         stopForeground(STOP_FOREGROUND_REMOVE)
@@ -150,6 +154,12 @@ class TravonetSocksService : Service() {
                         mode = TunnelMode.SOCKS5,
                         strategyName = activeStrategyDesc
                     )
+
+                    if (repository.isWakeLockEnabled()) {
+                        acquireWakeLock()
+                    } else {
+                        releaseWakeLock()
+                    }
 
                     startForegroundServiceNotification(profile.name, listenAddr, "Прокси активен на $listenAddr")
                     startStatsPolling(handle, profile.name, listenAddr)
@@ -241,6 +251,12 @@ class TravonetSocksService : Service() {
                         strategyName = activeStrategyDesc
                     )
 
+                    if (repository.isWakeLockEnabled()) {
+                        acquireWakeLock()
+                    } else {
+                        releaseWakeLock()
+                    }
+
                     startForegroundServiceNotification(
                         profile.name,
                         listenAddr,
@@ -251,6 +267,7 @@ class TravonetSocksService : Service() {
 
             } catch (e: kotlinx.coroutines.CancellationException) {
                 Log.i(TAG, "startProxy was cancelled")
+                releaseWakeLock()
                 TunnelManager.socksHandle = -1
                 isProxyActive = false
                 TunnelManager.updateState(TunnelStatus.DISCONNECTED)
@@ -258,6 +275,7 @@ class TravonetSocksService : Service() {
                 stopSelf()
             } catch (e: Throwable) {
                 Log.e(TAG, "Error starting socks proxy", e)
+                releaseWakeLock()
                 TunnelManager.socksHandle = -1
                 isProxyActive = false
                 TunnelManager.updateState(TunnelStatus.ERROR, e.localizedMessage ?: "Неизвестная ошибка")
@@ -297,6 +315,7 @@ class TravonetSocksService : Service() {
                 delay(2000)
                 if (!NativeCoreBridge.isProxyRunningNative()) {
                     Log.e(TAG, "Proxy core $coreTitle unexpectedly stopped in SOCKS mode")
+                    releaseWakeLock()
                     TunnelManager.socksHandle = -1
                     isProxyActive = false
                     TunnelManager.updateState(TunnelStatus.ERROR, "Ядро $coreTitle аварийно завершило работу")
@@ -318,6 +337,7 @@ class TravonetSocksService : Service() {
     }
 
     private fun stopProxy() {
+        releaseWakeLock()
         startJob?.cancel()
         startJob = null
         statsJob?.cancel()
@@ -347,6 +367,11 @@ class TravonetSocksService : Service() {
         stopSelf()
     }
 
+    override fun onTaskRemoved(rootIntent: Intent?) {
+        super.onTaskRemoved(rootIntent)
+        Log.d(TAG, "onTaskRemoved: app task removed from recents, keeping SOCKS5 service active")
+    }
+
     override fun onDestroy() {
         stopProxy()
         serviceReceiver?.let {
@@ -356,6 +381,61 @@ class TravonetSocksService : Service() {
         }
         serviceReceiver = null
         super.onDestroy()
+    }
+
+    private fun acquireWakeLock() {
+        if (wakeLock?.isHeld != true) {
+            try {
+                val powerManager = getSystemService(Context.POWER_SERVICE) as? PowerManager
+                wakeLock = powerManager?.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "TravonetVPN::SocksWakeLock")?.apply {
+                    setReferenceCounted(false)
+                    acquire(12 * 60 * 60 * 1000L) // 12 hours max timeout
+                }
+                Log.d(TAG, "Socks WakeLock acquired")
+            } catch (e: Exception) {
+                Log.w(TAG, "Failed to acquire socks wake lock", e)
+            }
+        }
+        if (wifiLock?.isHeld != true) {
+            try {
+                val wifiManager = applicationContext.getSystemService(Context.WIFI_SERVICE) as? android.net.wifi.WifiManager
+                val mode = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    android.net.wifi.WifiManager.WIFI_MODE_FULL_LOW_LATENCY
+                } else {
+                    android.net.wifi.WifiManager.WIFI_MODE_FULL_HIGH_PERF
+                }
+                wifiLock = wifiManager?.createWifiLock(mode, "TravonetVPN::SocksWifiLock")?.apply {
+                    setReferenceCounted(false)
+                    acquire()
+                }
+                Log.d(TAG, "Socks WifiLock acquired")
+            } catch (e: Exception) {
+                Log.w(TAG, "Failed to acquire socks wifi lock", e)
+            }
+        }
+    }
+
+    private fun releaseWakeLock() {
+        try {
+            if (wakeLock?.isHeld == true) {
+                wakeLock?.release()
+                Log.d(TAG, "Socks WakeLock released")
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to release socks wake lock", e)
+        } finally {
+            wakeLock = null
+        }
+        try {
+            if (wifiLock?.isHeld == true) {
+                wifiLock?.release()
+                Log.d(TAG, "Socks WifiLock released")
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to release socks wifi lock", e)
+        } finally {
+            wifiLock = null
+        }
     }
 
     private fun createNotificationChannel() {

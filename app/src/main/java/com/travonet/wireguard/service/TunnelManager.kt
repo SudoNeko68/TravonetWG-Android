@@ -68,7 +68,12 @@ object TunnelManager {
         try {
             val prefs = getPrefs(context)
             val statusStr = prefs.getString(KEY_STATUS, null) ?: return
-            val status = try { TunnelStatus.valueOf(statusStr) } catch (_: Throwable) { TunnelStatus.DISCONNECTED }
+            val rawStatus = try { TunnelStatus.valueOf(statusStr) } catch (_: Throwable) { TunnelStatus.DISCONNECTED }
+            val status = if (rawStatus == TunnelStatus.CONNECTING || rawStatus == TunnelStatus.STOPPING) {
+                TunnelStatus.DISCONNECTED
+            } else {
+                rawStatus
+            }
             val message = prefs.getString(KEY_MESSAGE, "") ?: ""
             val profileName = prefs.getString(KEY_PROFILE_NAME, "") ?: ""
             val profileId = prefs.getString(KEY_PROFILE_ID, null)
@@ -271,6 +276,12 @@ object TunnelManager {
         }
 
         // Query running service in :vpn process for current status
+        queryTunnelState(context)
+
+        return receiver
+    }
+
+    fun queryTunnelState(context: Context) {
         try {
             val queryIntent = Intent(ACTION_QUERY_TUNNEL_STATE).apply {
                 setPackage(context.packageName)
@@ -279,8 +290,6 @@ object TunnelManager {
         } catch (e: Exception) {
             Log.w(TAG, "Failed to query tunnel state", e)
         }
-
-        return receiver
     }
 
     fun registerServiceReceiver(context: Context): BroadcastReceiver {
@@ -339,6 +348,15 @@ object TunnelManager {
         )
         resetStats()
 
+        val targetProfileId = profile.id
+        CoroutineScope(Dispatchers.Main).launch {
+            delay(25000)
+            if (_state.value.status == TunnelStatus.CONNECTING && _state.value.profileId == targetProfileId) {
+                Log.w(TAG, "Connection attempt timed out for profile: $targetProfileId")
+                updateState(TunnelStatus.ERROR, "Превышено время ожидания подключения")
+            }
+        }
+
         when (mode) {
             TunnelMode.VPN -> {
                 val intent = Intent(context, TravonetVpnService::class.java).apply {
@@ -360,7 +378,8 @@ object TunnelManager {
     fun stop(context: Context) {
         init(context)
         val currentMode = _state.value.mode
-        updateState(status = TunnelStatus.STOPPING)
+        val wasConnecting = (_state.value.status == TunnelStatus.CONNECTING)
+        updateState(status = if (wasConnecting) TunnelStatus.DISCONNECTED else TunnelStatus.STOPPING)
 
         when (currentMode) {
             TunnelMode.VPN -> {
@@ -377,7 +396,7 @@ object TunnelManager {
             }
         }
 
-        // Failsafe watchdog: if state is still STOPPING or CONNECTING after 2s, force DISCONNECTED
+        // Failsafe watchdog: if state is still STOPPING after 2s, force DISCONNECTED
         CoroutineScope(Dispatchers.Main).launch {
             delay(2000)
             if (_state.value.status == TunnelStatus.STOPPING || _state.value.status == TunnelStatus.CONNECTING) {
