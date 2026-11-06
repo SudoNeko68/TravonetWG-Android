@@ -539,12 +539,20 @@ class TravonetVpnService : VpnService() {
         }
 
         val wgConfigRaw = com.travonet.wireguard.parser.ProxyLinkParser.extractEmbeddedWgConfig(profile.rawConfig)
-        // In VPN mode, FreeTURN must always receive a valid TUN descriptor so that system traffic is routed into it
-        val needsTun = true
+        if (wgConfigRaw.isNullOrBlank()) {
+            TunnelManager.updateState(
+                TunnelStatus.ERROR,
+                "Для FreeTURN в режиме VPN необходима конфигурация WireGuard (relay.conf). Добавьте её в профиль FreeTURN или переключите режим в SOCKS5."
+            )
+            stopForeground(STOP_FOREGROUND_REMOVE)
+            stopSelf()
+            return
+        }
 
+        val needsTun = true
         var tunFd = -1
         if (needsTun) {
-            val wgConfigToParse = wgConfigRaw ?: profile.rawConfig
+            val wgConfigToParse = wgConfigRaw
             val parsed = try {
                 WgConfigParser.parse(wgConfigToParse)
             } catch (e: Exception) {

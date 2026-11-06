@@ -744,6 +744,9 @@ fun AddFreeTurnDialog(
                     onValueChange = { wgConfig = it },
                     label = { Text("Конфигурация WireGuard (relay.conf)") },
                     placeholder = { Text("[Interface]\nPrivateKey = ...\n[Peer]\nPublicKey = ...") },
+                    supportingText = {
+                        Text("Обязательно для VPN-режима: инкапсулирует системный трафик в TURN-релей")
+                    },
                     maxLines = 4,
                     modifier = Modifier.fillMaxWidth()
                 )
