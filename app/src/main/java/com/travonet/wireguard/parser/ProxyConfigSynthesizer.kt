@@ -153,6 +153,11 @@ object ProxyConfigSynthesizer {
                             put("protocol", "dns")
                             put("action", "hijack-dns")
                         })
+                        orderedRules.put(JSONObject().apply {
+                            put("port", JSONArray().put(443))
+                            put("network", "udp")
+                            put("action", "reject")
+                        })
                     }
 
                     for (i in 0 until existingRules.length()) {
@@ -164,6 +169,7 @@ object ProxyConfigSynthesizer {
                         if (outbound.equals("dns", ignoreCase = true) || outbound.equals("dns-out", ignoreCase = true)) continue
                         val portArr = rule.optJSONArray("port")
                         if (portArr != null && portArr.length() == 1 && portArr.optInt(0) == 53 && (outbound == "direct" || action == "hijack-dns")) continue
+                        if (portArr != null && portArr.length() == 1 && portArr.optInt(0) == 443 && rule.optString("network") == "udp" && action == "reject") continue
                         if (rule.optString("protocol") == "dns" && (outbound == "direct" || action == "hijack-dns")) continue
                         orderedRules.put(rule)
                     }
@@ -199,17 +205,19 @@ object ProxyConfigSynthesizer {
                 servers.put(createSingboxDnsServer("1.1.1.1", "direct-dns-cf", ""))
             }
             DnsMode.SERVER -> {
-                servers.put(createSingboxDnsServer("1.1.1.1", "remote-dns", "proxy"))
-                servers.put(createSingboxDnsServer("8.8.8.8", "remote-dns-fallback", "proxy"))
+                // DoH over proxy is HTTP/2 over TLS over TCP: guaranteed to work on any proxy
+                // without relying on server UDP forwarding or suffering TSPU UDP drops.
+                servers.put(createSingboxDnsServer("https://1.1.1.1/dns-query", "remote-dns", "proxy"))
+                servers.put(createSingboxDnsServer("https://8.8.8.8/dns-query", "remote-dns-fallback", "proxy"))
                 servers.put(createSingboxDnsServer("77.88.8.8", "direct-dns", ""))
                 servers.put(createSingboxDnsServer("8.8.8.8", "direct-dns-alt", ""))
             }
             DnsMode.CUSTOM -> {
-                val custom = dohUrl.trim().ifBlank { "1.1.1.1" }
+                val custom = dohUrl.trim().ifBlank { "https://1.1.1.1/dns-query" }
                 servers.put(createSingboxDnsServer(custom, "remote-dns", "proxy"))
+                servers.put(createSingboxDnsServer("https://1.1.1.1/dns-query", "remote-dns-cf", "proxy"))
                 servers.put(createSingboxDnsServer("77.88.8.8", "direct-dns", ""))
                 servers.put(createSingboxDnsServer("8.8.8.8", "direct-dns-fallback", ""))
-                servers.put(createSingboxDnsServer("1.1.1.1", "direct-dns-cf", ""))
             }
         }
         return JSONObject().apply {
@@ -380,7 +388,12 @@ object ProxyConfigSynthesizer {
             put("protocol", "dns")
             put("settings", JSONObject())
         }
-        root.put("outbounds", JSONArray().put(proxyOutbound).put(directOutbound).put(dnsOutbound))
+        val blackholeOutbound = JSONObject().apply {
+            put("tag", "block")
+            put("protocol", "blackhole")
+            put("settings", JSONObject().put("response", JSONObject().put("type", "none")))
+        }
+        root.put("outbounds", JSONArray().put(proxyOutbound).put(directOutbound).put(dnsOutbound).put(blackholeOutbound))
 
         root.put("routing", JSONObject().apply {
             put("domainStrategy", if (dnsMode == DnsMode.SYSTEM) "UseIP" else "AsIs")
@@ -395,6 +408,12 @@ object ProxyConfigSynthesizer {
                         put("type", "field")
                         put("protocol", JSONArray().put("dns"))
                         put("outboundTag", "dns-out")
+                    })
+                    put(JSONObject().apply {
+                        put("type", "field")
+                        put("port", "443")
+                        put("network", "udp")
+                        put("outboundTag", "block")
                     })
                 }
                 put(JSONObject().apply {
@@ -414,13 +433,15 @@ object ProxyConfigSynthesizer {
                 servers.put("77.88.8.8")
             }
             DnsMode.SERVER -> {
-                servers.put("1.1.1.1")
-                servers.put("8.8.8.8")
+                servers.put("https://1.1.1.1/dns-query")
+                servers.put("https://8.8.8.8/dns-query")
+                servers.put("77.88.8.8")
             }
             DnsMode.CUSTOM -> {
                 if (dohUrl.isNotBlank() && !dohUrl.equals("local", ignoreCase = true)) servers.put(dohUrl)
-                servers.put("1.1.1.1")
-                servers.put("8.8.8.8")
+                servers.put("https://1.1.1.1/dns-query")
+                servers.put("https://8.8.8.8/dns-query")
+                servers.put("77.88.8.8")
             }
         }
         dnsObj.put("servers", servers)
@@ -477,6 +498,11 @@ object ProxyConfigSynthesizer {
                     put(JSONObject().apply {
                         put("protocol", "dns")
                         put("action", "hijack-dns")
+                    })
+                    put(JSONObject().apply {
+                        put("port", JSONArray().put(443))
+                        put("network", "udp")
+                        put("action", "reject")
                     })
                     put(JSONObject().apply {
                         put("action", "sniff")

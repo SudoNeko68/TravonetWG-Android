@@ -57,6 +57,7 @@ class TravonetVpnService : VpnService() {
     @Volatile private var isProxyActive = false
     private var wakeLock: PowerManager.WakeLock? = null
     private var wifiLock: android.net.wifi.WifiManager.WifiLock? = null
+    @Volatile private var physicalNetwork: Network? = null
     private val repository by lazy { AppRepository(this) }
 
     companion object {
@@ -155,7 +156,7 @@ class TravonetVpnService : VpnService() {
             val builder = Builder()
                 .setSession("TravonetVPN - ${profile.name}")
                 .setMtu(parsed.iface.mtu)
-                .setBlocking(true)
+                .setBlocking(false)
 
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                 builder.setMetered(false)
@@ -460,7 +461,7 @@ class TravonetVpnService : VpnService() {
                 // не производит handshake (тишина в эфире) — туннель не должен разрываться.
                 val hasOutgoingTraffic = prevTxBytes >= 0L && (stats.txBytes - prevTxBytes) > 500L
                 val noIncomingTraffic = prevRxBytes >= 0L && stats.rxBytes == prevRxBytes
-                val isHandshakeStale = stats.lastHandshakeSec > 0L && (nowSec - stats.lastHandshakeSec) > 40
+                val isHandshakeStale = stats.lastHandshakeSec > 0L && (nowSec - stats.lastHandshakeSec) > 180
 
                 if (hasOutgoingTraffic && noIncomingTraffic && isHandshakeStale) {
                     staleCount++
@@ -545,7 +546,7 @@ class TravonetVpnService : VpnService() {
             val builder = Builder()
                 .setSession("TravonetVPN - ${profile.name} (FreeTURN)")
                 .setMtu(mtu)
-                .setBlocking(true)
+                .setBlocking(false)
 
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                 builder.setMetered(false)
@@ -748,7 +749,7 @@ class TravonetVpnService : VpnService() {
         val builder = Builder()
             .setSession("TravonetVPN - ${profile.name}")
             .setMtu(1420)
-            .setBlocking(true)
+            .setBlocking(false)
             .addAddress("172.19.0.1", 30)
             .addRoute("0.0.0.0", 0)
 
@@ -1052,10 +1053,16 @@ class TravonetVpnService : VpnService() {
         connectivityManager = cm
         val callback = object : ConnectivityManager.NetworkCallback() {
             override fun onAvailable(network: Network) {
+                Log.i(TAG, "Physical network available: $network")
+                physicalNetwork = network
                 updateUnderlyingNetwork()
             }
 
             override fun onLost(network: Network) {
+                Log.i(TAG, "Physical network lost: $network")
+                if (physicalNetwork == network) {
+                    physicalNetwork = null
+                }
                 updateUnderlyingNetwork()
             }
 
@@ -1079,15 +1086,11 @@ class TravonetVpnService : VpnService() {
 
     private fun updateUnderlyingNetwork() {
         try {
-            val cm = connectivityManager ?: return
-            val activeNet = cm.activeNetwork
-            if (activeNet != null) {
-                val caps = cm.getNetworkCapabilities(activeNet)
-                if (caps != null && caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN)) {
-                    Log.d(TAG, "Setting active physical underlying network: $activeNet")
-                    setUnderlyingNetworks(arrayOf(activeNet))
-                    return
-                }
+            val net = physicalNetwork
+            if (net != null) {
+                Log.d(TAG, "Setting active physical underlying network: $net")
+                setUnderlyingNetworks(arrayOf(net))
+                return
             }
             Log.d(TAG, "Resetting underlying network to auto (null)")
             setUnderlyingNetworks(null)
@@ -1106,6 +1109,7 @@ class TravonetVpnService : VpnService() {
             }
             defaultNetworkCallback = null
         }
+        physicalNetwork = null
     }
 
     private fun acquireWakeLock() {
