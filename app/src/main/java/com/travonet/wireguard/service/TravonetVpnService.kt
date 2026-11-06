@@ -451,6 +451,8 @@ class TravonetVpnService : VpnService() {
             var staleCount = 0
             var prevTxBytes = -1L
             var prevRxBytes = -1L
+            val myUid = android.os.Process.myUid()
+            var prevUidTx = -1L
             while (isActive && TunnelManager.vpnHandle == handle) {
                 delay(5000)
                 val configDump = try {
@@ -461,25 +463,28 @@ class TravonetVpnService : VpnService() {
                 val stats = TunnelManager.parseUapiStats(configDump)
                 val nowSec = System.currentTimeMillis() / 1000
 
-                // Соединение считается потерянным ТОЛЬКО если:
-                // 1. Был первоначальный handshake (lastHandshakeSec > 0).
-                // 2. Идет отправка пакетов (txBytes растет), но нет ответа (rxBytes не меняется).
-                // 3. Handshake не обновлялся более 180 секунд (Reject-After-Time в WireGuard).
-                // Если телефон в режиме ожидания (нет отправки пакетов), WireGuard намеренно
-                // не производит handshake (тишина в эфире) — туннель не должен разрываться.
-                val hasOutgoingTraffic = prevTxBytes >= 0L && (stats.txBytes - prevTxBytes) > 500L
+                val curUidTx = android.net.TrafficStats.getUidTxBytes(myUid).let { if (it < 0) 0L else it }
+                val hasOutgoingTraffic = (prevTxBytes >= 0L && (stats.txBytes - prevTxBytes) > 500L) ||
+                        (prevUidTx >= 0L && (curUidTx - prevUidTx) > 1024L)
                 val noIncomingTraffic = prevRxBytes >= 0L && stats.rxBytes == prevRxBytes
                 val isHandshakeStale = stats.lastHandshakeSec > 0L && (nowSec - stats.lastHandshakeSec) > 180
 
-                if (hasOutgoingTraffic && noIncomingTraffic && isHandshakeStale) {
+                // Соединение считается потерянным, если:
+                // 1. Handshake протух (> 180 сек) и входящий трафик остановился
+                // ИЛИ
+                // 2. Идет активная отправка пакетов (приложения шлют трафик), но ответа нет и прошло > 60 сек с handshake
+                val isConnectionLost = (isHandshakeStale && noIncomingTraffic) ||
+                        (hasOutgoingTraffic && noIncomingTraffic && stats.lastHandshakeSec > 0L && (nowSec - stats.lastHandshakeSec) > 60)
+
+                if (isConnectionLost) {
                     staleCount++
-                    if (staleCount >= 3) { // 15 секунд подтвержденного отсутствия ответа при отправке
-                        Log.w(TAG, "Connection lost (outgoing traffic without response for ${nowSec - stats.lastHandshakeSec}s); auto-reconnecting...")
+                    if (staleCount >= 3) { // 15 секунд подтвержденного отсутствия ответа
+                        Log.w(TAG, "WireGuard connection lost (handshake stale for ${nowSec - stats.lastHandshakeSec}s, no rx); auto-reconnecting...")
                         TunnelManager.updateState(TunnelStatus.CONNECTING, "Восстановление соединения...")
                         tunnelMutex.withLock {
                             releaseTunnelLocked()
                         }
-                        delay(2000)
+                        delay(1500)
                         if (isActive && !destroyed) {
                             tunnelMutex.withLock {
                                 startTunnelLocked(profile, strategy, 0)
@@ -493,6 +498,7 @@ class TravonetVpnService : VpnService() {
 
                 prevTxBytes = stats.txBytes
                 prevRxBytes = stats.rxBytes
+                prevUidTx = curUidTx
             }
         }
     }

@@ -98,11 +98,19 @@ object ProxyConfigSynthesizer {
                             continue
                         }
                         if (outType != "direct" && outType != "block") {
+                            if (!outObj.has("tcp_keep_alive")) {
+                                outObj.put("tcp_keep_alive", "15s")
+                            }
                             if (!outObj.has("tcp_keep_alive_interval")) {
                                 outObj.put("tcp_keep_alive_interval", "15s")
                             }
                             if (!outObj.has("connect_timeout")) {
                                 outObj.put("connect_timeout", "10s")
+                            }
+                            if (outType == "hysteria2" || outType == "tuic" || outType == "vless") {
+                                if (!outObj.has("keep_alive_period")) {
+                                    outObj.put("keep_alive_period", "10s")
+                                }
                             }
                         }
                         // Normalize Hysteria2 server_ports (must be JSONArray with start:end syntax)
@@ -314,6 +322,7 @@ object ProxyConfigSynthesizer {
                 put("auto_route", false)
                 put("strict_route", false)
                 put("stack", "gvisor")
+                put("udp_timeout", "30s")
             }
         }
     }
@@ -470,11 +479,19 @@ object ProxyConfigSynthesizer {
 
         val outType = proxyOutbound.optString("type").lowercase()
         if (outType != "direct" && outType != "block" && outType != "dns") {
+            if (!proxyOutbound.has("tcp_keep_alive")) {
+                proxyOutbound.put("tcp_keep_alive", "15s")
+            }
             if (!proxyOutbound.has("tcp_keep_alive_interval")) {
                 proxyOutbound.put("tcp_keep_alive_interval", "15s")
             }
             if (!proxyOutbound.has("connect_timeout")) {
                 proxyOutbound.put("connect_timeout", "10s")
+            }
+            if (outType == "hysteria2" || outType == "tuic" || outType == "vless") {
+                if (!proxyOutbound.has("keep_alive_period")) {
+                    proxyOutbound.put("keep_alive_period", "10s")
+                }
             }
         }
         val directOutbound = JSONObject().apply {

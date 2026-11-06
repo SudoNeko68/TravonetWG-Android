@@ -417,11 +417,11 @@ object WgConfigParser {
     }
 
     /**
-     * Гарантирует наличие PersistentKeepalive = 25 для каждого [Peer].
+     * Гарантирует наличие PersistentKeepalive = 15 для каждого [Peer].
      * Без keepalive мобильные операторы и роутеры сбрасывают UDP NAT-сессию
      * через 20-30 секунд простоя, из-за чего входящий и фоновый трафик перестаёт поступать.
      */
-    fun ensurePersistentKeepalive(rawConfig: String, defaultInterval: Int = 25): String {
+    fun ensurePersistentKeepalive(rawConfig: String, defaultInterval: Int = 15): String {
         val lines = rawConfig.lines()
         val result = mutableListOf<String>()
         var inPeer = false
