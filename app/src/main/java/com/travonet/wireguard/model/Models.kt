@@ -27,6 +27,18 @@ enum class WarpRelayMode {
     NONE
 }
 
+/**
+ * How DNS requests should be resolved.
+ * SYSTEM — direct via the system/underlying network resolver.
+ * SERVER — through the proxy server (DNS exits from the server side).
+ * CUSTOM — through the user-selected DNS provider (DoH/DoT/UDP).
+ */
+enum class DnsMode(val displayName: String) {
+    SYSTEM("Системный DNS"),
+    SERVER("DNS через VPN"),
+    CUSTOM("Свой DNS")
+}
+
 data class TunnelState(
     val status: TunnelStatus = TunnelStatus.DISCONNECTED,
     val message: String = "",

@@ -4,6 +4,7 @@ import android.content.Context
 import android.content.SharedPreferences
 import com.travonet.wireguard.BuildConfig
 import com.travonet.wireguard.model.DefaultStrategies
+import com.travonet.wireguard.model.DnsMode
 import com.travonet.wireguard.model.EvasionStrategy
 import com.travonet.wireguard.model.Subscription
 import com.travonet.wireguard.model.TunnelMode
@@ -91,15 +92,8 @@ class AppRepository(context: Context) {
 
     fun replaceSubscriptionProfiles(subUrl: String, newProfiles: List<WgProfile>) {
         val current = getProfiles().toMutableList()
-        val newIds = newProfiles.map { it.id }.toSet()
-
-        // Cleanly replace old profiles belonging to this subscription or with matching IDs/endpoints
-        current.removeAll { p ->
-            p.subscriptionUrl == subUrl ||
-            p.id in newIds ||
-            newProfiles.any { np -> np.name == p.name && np.endpoint == p.endpoint }
-        }
-
+        // Only remove profiles belonging to this specific subscription
+        current.removeAll { p -> p.subscriptionUrl == subUrl }
         current.addAll(newProfiles)
         saveProfiles(current)
     }
@@ -308,7 +302,7 @@ class AppRepository(context: Context) {
     }
 
     fun isWakeLockEnabled(): Boolean {
-        return prefs.getBoolean("wakelock_enabled", false)
+        return prefs.getBoolean("wakelock_enabled", true)
     }
 
     fun setWakeLockEnabled(enabled: Boolean) {
@@ -329,6 +323,151 @@ class AppRepository(context: Context) {
 
     fun setShowAddressesEnabled(enabled: Boolean) {
         prefs.edit().putBoolean("show_addresses_enabled", enabled).apply()
+    }
+
+    // Global DNS Settings
+    fun getDnsMode(): DnsMode {
+        val raw = prefs.getString("dns_mode", null)
+        if (!raw.isNullOrBlank()) {
+            runCatching { DnsMode.valueOf(raw) }.getOrNull()?.let { return it }
+        }
+        // Default to SERVER (DNS through VPN tunnel) for security and reliability.
+        return if (isOverrideDns()) DnsMode.CUSTOM else DnsMode.SERVER
+    }
+
+    fun setDnsMode(mode: DnsMode) {
+        prefs.edit()
+            .putString("dns_mode", mode.name)
+            .putBoolean("override_dns_enabled", mode != DnsMode.SYSTEM)
+            .apply()
+    }
+
+    fun getDnsPreset(): String {
+        return prefs.getString("dns_preset", "cloudflare") ?: "cloudflare"
+    }
+
+    fun setDnsPreset(preset: String) {
+        prefs.edit().putString("dns_preset", preset).apply()
+    }
+
+    fun getCustomDns(): String {
+        return prefs.getString("custom_dns", "1.1.1.1, 8.8.8.8") ?: "1.1.1.1, 8.8.8.8"
+    }
+
+    fun setCustomDns(customDns: String) {
+        prefs.edit().putString("custom_dns", customDns.trim()).apply()
+    }
+
+    fun getCustomDnsType(): String {
+        return prefs.getString("custom_dns_type", "DOH") ?: "DOH"
+    }
+
+    fun setCustomDnsType(type: String) {
+        prefs.edit().putString("custom_dns_type", type.uppercase()).apply()
+    }
+
+    fun getCustomDnsUdp(): String {
+        return prefs.getString("custom_dns_udp", "1.1.1.1, 1.0.0.1") ?: "1.1.1.1, 1.0.0.1"
+    }
+
+    fun setCustomDnsUdp(value: String) {
+        prefs.edit().putString("custom_dns_udp", value.trim()).apply()
+    }
+
+    fun getCustomDnsDot(): String {
+        return prefs.getString("custom_dns_dot", "tls://1.1.1.1:853") ?: "tls://1.1.1.1:853"
+    }
+
+    fun setCustomDnsDot(value: String) {
+        prefs.edit().putString("custom_dns_dot", value.trim()).apply()
+    }
+
+    fun getCustomDnsDoh(): String {
+        return prefs.getString("custom_dns_doh", "https://1.1.1.1/dns-query") ?: "https://1.1.1.1/dns-query"
+    }
+
+    fun setCustomDnsDoh(value: String) {
+        prefs.edit().putString("custom_dns_doh", value.trim()).apply()
+    }
+
+    fun getCustomHosts(): String {
+        return prefs.getString("custom_hosts", "") ?: ""
+    }
+
+    fun setCustomHosts(value: String) {
+        prefs.edit().putString("custom_hosts", value).apply()
+    }
+
+    fun isOverrideDns(): Boolean {
+        return prefs.getBoolean("override_dns_enabled", false)
+    }
+
+    fun setOverrideDns(enabled: Boolean) {
+        prefs.edit().putBoolean("override_dns_enabled", enabled).apply()
+    }
+
+    fun getEffectiveDnsServers(): List<String> {
+        when (getDnsMode()) {
+            DnsMode.SYSTEM -> return emptyList()
+            DnsMode.SERVER -> return listOf("1.1.1.1", "1.0.0.1")
+            DnsMode.CUSTOM -> Unit
+        }
+        val udpList = getCustomDnsUdp().split(",", " ", ";")
+            .map { it.trim() }
+            .filter { it.isNotEmpty() && !it.startsWith("http", ignoreCase = true) && !it.startsWith("tls", ignoreCase = true) }
+        val fallbackUdp = if (udpList.isNotEmpty()) udpList else listOf("1.1.1.1", "1.0.0.1")
+
+        return when (getDnsPreset().lowercase()) {
+            "cloudflare" -> listOf("1.1.1.1", "1.0.0.1")
+            "google" -> listOf("8.8.8.8", "8.8.4.4")
+            "adguard" -> listOf("94.140.14.14", "94.140.15.15")
+            "quad9" -> listOf("9.9.9.9", "149.112.112.112")
+            "custom" -> {
+                when (getCustomDnsType().uppercase()) {
+                    "UDP" -> fallbackUdp
+                    "DOT" -> {
+                        val dot = getCustomDnsDot().removePrefix("tls://").substringBefore(':').substringBefore('/')
+                        if (dot.matches(Regex("\\d+\\.\\d+\\.\\d+\\.\\d+"))) listOf(dot) else fallbackUdp
+                    }
+                    else -> fallbackUdp
+                }
+            }
+            "system" -> emptyList()
+            else -> listOf("1.1.1.1", "1.0.0.1")
+        }
+    }
+
+    fun getEffectiveDnsDohUrl(): String {
+        when (getDnsMode()) {
+            DnsMode.SYSTEM -> return "local"
+            DnsMode.SERVER -> return "https://1.1.1.1/dns-query"
+            DnsMode.CUSTOM -> Unit
+        }
+        if (getDnsPreset().lowercase() == "custom") {
+            return when (getCustomDnsType().uppercase()) {
+                "UDP" -> {
+                    val rawUdp = getCustomDnsUdp().trim()
+                    val firstIp = rawUdp.split(",", " ", ";").firstOrNull { it.isNotBlank() } ?: "1.1.1.1"
+                    "udp://$firstIp"
+                }
+                "DOT" -> {
+                    val rawDot = getCustomDnsDot().trim()
+                    if (rawDot.startsWith("tls://", ignoreCase = true)) rawDot else "tls://$rawDot"
+                }
+                else -> {
+                    val rawDoh = getCustomDnsDoh().trim()
+                    if (rawDoh.startsWith("https://", ignoreCase = true)) rawDoh else "https://$rawDoh"
+                }
+            }
+        }
+        return when (getDnsPreset().lowercase()) {
+            "cloudflare" -> "https://1.1.1.1/dns-query"
+            "google" -> "https://dns.google/dns-query"
+            "adguard" -> "https://dns.adguard-dns.com/dns-query"
+            "quad9" -> "https://dns.quad9.net/dns-query"
+            "system" -> "local"
+            else -> "https://1.1.1.1/dns-query"
+        }
     }
 
     // Subscription Settings (Multi-subscription support & legacy compatibility)
@@ -438,5 +577,42 @@ class AppRepository(context: Context) {
 
     fun setLastSubscriptionUpdate(timestamp: Long) {
         prefs.edit().putLong("subscription_last_update", timestamp).apply()
+    }
+
+    // Protocol Delegations
+    fun getProtocolDelegations(): Map<String, String> {
+        val raw = prefs.getString("protocol_delegations", null) ?: return emptyMap()
+        return try {
+            val json = JSONObject(raw)
+            val map = mutableMapOf<String, String>()
+            val keys = json.keys()
+            while (keys.hasNext()) {
+                val k = keys.next()
+                map[k] = json.getString(k)
+            }
+            map
+        } catch (_: Exception) {
+            emptyMap()
+        }
+    }
+
+    fun setProtocolDelegation(protocolId: String, coreId: String) {
+        val current = getProtocolDelegations().toMutableMap()
+        current[protocolId] = coreId
+        val json = JSONObject()
+        current.forEach { (k, v) -> json.put(k, v) }
+        prefs.edit().putString("protocol_delegations", json.toString()).apply()
+    }
+
+    fun resetProtocolDelegations() {
+        prefs.edit().remove("protocol_delegations").apply()
+    }
+
+    fun getSelectedCoreVersion(coreId: String): String? {
+        return prefs.getString("core_version_$coreId", null)
+    }
+
+    fun setSelectedCoreVersion(coreId: String, version: String) {
+        prefs.edit().putString("core_version_$coreId", version).apply()
     }
 }

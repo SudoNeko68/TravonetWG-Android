@@ -6,6 +6,9 @@ import android.net.Uri
 import android.os.Build
 import android.os.PowerManager
 import android.provider.Settings
+import android.widget.Toast
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
@@ -18,8 +21,15 @@ import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.FolderOpen
+import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.FilterChip
 import androidx.compose.material3.HorizontalDivider
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
@@ -39,6 +49,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import com.travonet.wireguard.model.DnsMode
 import com.travonet.wireguard.model.WarpRelayMode
 
 /**
@@ -56,6 +67,14 @@ fun AppSettingsDialog(
     isWakeLock: Boolean,
     isAutoReconnect: Boolean,
     isShowAddresses: Boolean,
+    currentDnsPreset: String = "cloudflare",
+    currentCustomDns: String = "1.1.1.1, 8.8.8.8",
+    currentDnsMode: DnsMode = DnsMode.CUSTOM,
+    currentCustomDnsType: String = "DOH",
+    currentCustomDnsUdp: String = "1.1.1.1, 1.0.0.1",
+    currentCustomDnsDot: String = "tls://1.1.1.1:853",
+    currentCustomDnsDoh: String = "https://1.1.1.1/dns-query",
+    currentCustomHosts: String = "",
     onDismiss: () -> Unit,
     onSave: (
         socksAddr: String,
@@ -65,7 +84,15 @@ fun AppSettingsDialog(
         foregroundService: Boolean,
         wakeLock: Boolean,
         autoReconnect: Boolean,
-        showAddresses: Boolean
+        showAddresses: Boolean,
+        dnsPreset: String,
+        customDns: String,
+        dnsMode: DnsMode,
+        customDnsType: String,
+        customDnsUdp: String,
+        customDnsDot: String,
+        customDnsDoh: String,
+        customHosts: String
     ) -> Unit
 ) {
     var socksAddr by remember { mutableStateOf(currentSocksAddr) }
@@ -76,6 +103,15 @@ fun AppSettingsDialog(
     var wakeLock by remember { mutableStateOf(isWakeLock) }
     var autoReconnect by remember { mutableStateOf(isAutoReconnect) }
     var showAddresses by remember { mutableStateOf(isShowAddresses) }
+    var dnsPreset by remember { mutableStateOf(currentDnsPreset) }
+    var customDns by remember { mutableStateOf(currentCustomDns) }
+    var dnsMode by remember { mutableStateOf(currentDnsMode) }
+    var customDnsType by remember { mutableStateOf(currentCustomDnsType) }
+    var customDnsUdp by remember { mutableStateOf(currentCustomDnsUdp) }
+    var customDnsDot by remember { mutableStateOf(currentCustomDnsDot) }
+    var customDnsDoh by remember { mutableStateOf(currentCustomDnsDoh) }
+    var customHosts by remember { mutableStateOf(currentCustomHosts) }
+    var showCustomDnsConfigDialog by remember { mutableStateOf(false) }
 
     val context = LocalContext.current
     val powerManager = remember { context.getSystemService(Context.POWER_SERVICE) as? PowerManager }
@@ -90,7 +126,8 @@ fun AppSettingsDialog(
     }
 
     val customRelayValid = relayMode != WarpRelayMode.CUSTOM || relayUrl.isNotBlank()
-    val canSave = socksAddr.isNotBlank() && customRelayValid
+    val customDnsValid = dnsMode != DnsMode.CUSTOM || dnsPreset != "custom" || customDns.isNotBlank()
+    val canSave = socksAddr.isNotBlank() && customRelayValid && customDnsValid
 
     AlertDialog(
         onDismissRequest = onDismiss,
@@ -198,6 +235,131 @@ fun AppSettingsDialog(
                 HorizontalDivider(Modifier.padding(vertical = 2.dp))
 
                 Text(
+                    text = "Режим DNS",
+                    style = MaterialTheme.typography.titleSmall,
+                    fontWeight = FontWeight.Bold
+                )
+
+                RelayModeRow(
+                    title = "Системный DNS",
+                    subtitle = "Использовать DNS от сети Wi-Fi / оператора связи (запросы не перехватываются)",
+                    selected = dnsMode == DnsMode.SYSTEM,
+                    enabled = true,
+                    onClick = { dnsMode = DnsMode.SYSTEM }
+                )
+
+                RelayModeRow(
+                    title = "DNS через VPN",
+                    subtitle = "Безопасный DNS внутри туннеля (из профиля WireGuard или DoH через прокси)",
+                    selected = dnsMode == DnsMode.SERVER,
+                    enabled = true,
+                    onClick = { dnsMode = DnsMode.SERVER }
+                )
+
+                RelayModeRow(
+                    title = "Свой DNS",
+                    subtitle = "Выбрать публичный DNS резолвер или настроить собственный UDP, DoT, DoH и hosts",
+                    selected = dnsMode == DnsMode.CUSTOM,
+                    enabled = true,
+                    onClick = { dnsMode = DnsMode.CUSTOM },
+                    trailingContent = {
+                        IconButton(
+                            onClick = {
+                                dnsMode = DnsMode.CUSTOM
+                                showCustomDnsConfigDialog = true
+                            }
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.Settings,
+                                contentDescription = "Настройки своего DNS",
+                                tint = MaterialTheme.colorScheme.primary
+                            )
+                        }
+                    }
+                )
+
+                if (dnsMode == DnsMode.CUSTOM) {
+                    Spacer(Modifier.height(4.dp))
+                    Text(
+                        text = "Провайдер DNS:",
+                        style = MaterialTheme.typography.bodySmall,
+                        fontWeight = FontWeight.SemiBold,
+                        color = MaterialTheme.colorScheme.primary
+                    )
+                    RelayModeRow(
+                        title = "Cloudflare (1.1.1.1)",
+                        subtitle = "1.1.1.1, 1.0.0.1 (DoH https://1.1.1.1/dns-query)",
+                        selected = dnsPreset == "cloudflare",
+                        enabled = true,
+                        onClick = { dnsPreset = "cloudflare" }
+                    )
+                    RelayModeRow(
+                        title = "Google (8.8.8.8)",
+                        subtitle = "8.8.8.8, 8.8.4.4 (DoH https://dns.google/dns-query)",
+                        selected = dnsPreset == "google",
+                        enabled = true,
+                        onClick = { dnsPreset = "google" }
+                    )
+                    RelayModeRow(
+                        title = "AdGuard DNS",
+                        subtitle = "94.140.14.14 (DoH с блокировкой рекламы и трекеров)",
+                        selected = dnsPreset == "adguard",
+                        enabled = true,
+                        onClick = { dnsPreset = "adguard" }
+                    )
+                    RelayModeRow(
+                        title = "Quad9",
+                        subtitle = "9.9.9.9 (DoH с защитой от фишинга и вредоносных сайтов)",
+                        selected = dnsPreset == "quad9",
+                        enabled = true,
+                        onClick = { dnsPreset = "quad9" }
+                    )
+                    RelayModeRow(
+                        title = "Произвольный DNS",
+                        subtitle = "Тонкая настройка: UDP, DoT, DoH и hosts",
+                        selected = dnsPreset == "custom",
+                        enabled = true,
+                        onClick = {
+                            dnsPreset = "custom"
+                            showCustomDnsConfigDialog = true
+                        },
+                        trailingContent = {
+                            IconButton(
+                                onClick = {
+                                    dnsPreset = "custom"
+                                    showCustomDnsConfigDialog = true
+                                }
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Default.Settings,
+                                    contentDescription = "Настройки своего DNS",
+                                    tint = MaterialTheme.colorScheme.primary
+                                )
+                            }
+                        }
+                    )
+
+                    if (dnsPreset == "custom") {
+                        OutlinedTextField(
+                            value = customDns,
+                            onValueChange = { customDns = it },
+                            label = { Text("DNS серверы") },
+                            placeholder = { Text("1.1.1.1, 8.8.8.8 или https://...") },
+                            singleLine = true,
+                            isError = customDns.isBlank(),
+                            supportingText = {
+                                if (customDns.isBlank()) {
+                                    Text("Введите хотя бы один IP-адрес или DoH URL")
+                                }
+                            },
+                            modifier = Modifier.fillMaxWidth()
+                        )
+                    }
+                }
+
+                HorizontalDivider(Modifier.padding(vertical = 2.dp))
+
+                Text(
                     text = "Релей регистрации WARP",
                     style = MaterialTheme.typography.titleSmall,
                     fontWeight = FontWeight.Bold
@@ -278,12 +440,217 @@ fun AppSettingsDialog(
                         foregroundService,
                         wakeLock,
                         autoReconnect,
-                        showAddresses
+                        showAddresses,
+                        dnsPreset,
+                        customDns.trim(),
+                        dnsMode,
+                        customDnsType,
+                        customDnsUdp.trim(),
+                        customDnsDot.trim(),
+                        customDnsDoh.trim(),
+                        customHosts.trim()
                     )
                 },
                 enabled = canSave
             ) {
                 Text("Сохранить")
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) {
+                Text("Отмена")
+            }
+        }
+    )
+
+    if (showCustomDnsConfigDialog) {
+        CustomDnsConfigDialog(
+            initialType = customDnsType,
+            initialUdp = customDnsUdp,
+            initialDot = customDnsDot,
+            initialDoh = customDnsDoh,
+            initialHosts = customHosts,
+            onDismiss = { showCustomDnsConfigDialog = false },
+            onApply = { type, udp, dot, doh, hosts ->
+                customDnsType = type
+                customDnsUdp = udp
+                customDnsDot = dot
+                customDnsDoh = doh
+                customHosts = hosts
+                dnsMode = DnsMode.CUSTOM
+                dnsPreset = "custom"
+                customDns = when (type) {
+                    "UDP" -> udp
+                    "DOT" -> dot
+                    else -> doh
+                }
+                showCustomDnsConfigDialog = false
+            }
+        )
+    }
+}
+
+@Composable
+fun CustomDnsConfigDialog(
+    initialType: String,
+    initialUdp: String,
+    initialDot: String,
+    initialDoh: String,
+    initialHosts: String,
+    onDismiss: () -> Unit,
+    onApply: (type: String, udp: String, dot: String, doh: String, hosts: String) -> Unit
+) {
+    var prefType by remember { mutableStateOf(if (initialType in listOf("UDP", "DOT", "DOH")) initialType else "DOH") }
+    var udpText by remember { mutableStateOf(initialUdp) }
+    var dotText by remember { mutableStateOf(initialDot) }
+    var dohText by remember { mutableStateOf(initialDoh) }
+    var hostsText by remember { mutableStateOf(initialHosts) }
+
+    val context = LocalContext.current
+    val hostsFilePickerLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.GetContent()
+    ) { uri: Uri? ->
+        if (uri != null) {
+            try {
+                val content = context.contentResolver.openInputStream(uri)?.bufferedReader()?.use { it.readText() }
+                if (content != null) {
+                    hostsText = content
+                    Toast.makeText(context, "Файл hosts загружен (${content.lines().size} строк)", Toast.LENGTH_SHORT).show()
+                }
+            } catch (e: Exception) {
+                Toast.makeText(context, "Ошибка чтения файла: ${e.message}", Toast.LENGTH_LONG).show()
+            }
+        }
+    }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Настройки DNS") },
+        text = {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .heightIn(max = 500.dp)
+                    .verticalScroll(rememberScrollState())
+                    .imePadding(),
+                verticalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                Text(
+                    text = "Предпочитаемый тип протокола:",
+                    style = MaterialTheme.typography.titleSmall,
+                    fontWeight = FontWeight.Bold
+                )
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    FilterChip(
+                        selected = prefType == "DOH",
+                        onClick = { prefType = "DOH" },
+                        label = { Text("DoH") }
+                    )
+                    FilterChip(
+                        selected = prefType == "DOT",
+                        onClick = { prefType = "DOT" },
+                        label = { Text("DoT") }
+                    )
+                    FilterChip(
+                        selected = prefType == "UDP",
+                        onClick = { prefType = "UDP" },
+                        label = { Text("UDP") }
+                    )
+                }
+
+                Text(
+                    text = when (prefType) {
+                        "DOH" -> "DoH (DNS-over-HTTPS): шифрованный DNS поверх HTTPS, лучший обход блокировок."
+                        "DOT" -> "DoT (DNS-over-TLS): шифрованный DNS через TLS на порту 853."
+                        else -> "UDP: стандартный открытый DNS (минимальная задержка, но без шифрования)."
+                    },
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+
+                OutlinedTextField(
+                    value = udpText,
+                    onValueChange = { udpText = it },
+                    label = { Text("UDP DNS серверы (IP через запятую)") },
+                    placeholder = { Text("1.1.1.1, 1.0.0.1") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth()
+                )
+
+                OutlinedTextField(
+                    value = dotText,
+                    onValueChange = { dotText = it },
+                    label = { Text("DoT (DNS-over-TLS)") },
+                    placeholder = { Text("tls://1.1.1.1:853") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth()
+                )
+
+                OutlinedTextField(
+                    value = dohText,
+                    onValueChange = { dohText = it },
+                    label = { Text("DoH (DNS-over-HTTPS)") },
+                    placeholder = { Text("https://1.1.1.1/dns-query") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth()
+                )
+
+                HorizontalDivider(Modifier.padding(vertical = 4.dp))
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        text = "Свой файл hosts",
+                        style = MaterialTheme.typography.titleSmall,
+                        fontWeight = FontWeight.Bold
+                    )
+                    Row {
+                        IconButton(
+                            onClick = { hostsFilePickerLauncher.launch("*/*") }
+                        ) {
+                            Icon(Icons.Default.FolderOpen, contentDescription = "Загрузить из файла")
+                        }
+                        if (hostsText.isNotBlank()) {
+                            IconButton(
+                                onClick = { hostsText = "" }
+                            ) {
+                                Icon(Icons.Default.Delete, contentDescription = "Очистить hosts")
+                            }
+                        }
+                    }
+                }
+
+                Text(
+                    text = "Формат: IP домен (например, 127.0.0.1 ads.com или 0.0.0.0 tracker.com для блокировки рекламы).",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+
+                OutlinedTextField(
+                    value = hostsText,
+                    onValueChange = { hostsText = it },
+                    label = { Text("Правила hosts") },
+                    placeholder = { Text("127.0.0.1 adservice.google.com\n0.0.0.0 telemetry.app.com") },
+                    minLines = 4,
+                    maxLines = 8,
+                    modifier = Modifier.fillMaxWidth()
+                )
+            }
+        },
+        confirmButton = {
+            TextButton(
+                onClick = {
+                    onApply(prefType, udpText.trim(), dotText.trim(), dohText.trim(), hostsText.trim())
+                }
+            ) {
+                Text("Применить")
             }
         },
         dismissButton = {
@@ -300,7 +667,8 @@ private fun RelayModeRow(
     subtitle: String,
     selected: Boolean,
     enabled: Boolean,
-    onClick: () -> Unit
+    onClick: () -> Unit,
+    trailingContent: (@Composable () -> Unit)? = null
 ) {
     Row(
         modifier = Modifier
@@ -335,6 +703,9 @@ private fun RelayModeRow(
                 maxLines = 2,
                 overflow = TextOverflow.Ellipsis
             )
+        }
+        if (trailingContent != null) {
+            trailingContent()
         }
     }
 }

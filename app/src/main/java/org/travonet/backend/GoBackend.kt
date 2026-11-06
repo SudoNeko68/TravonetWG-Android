@@ -1,12 +1,48 @@
 package org.travonet.backend
 
 object GoBackend {
-    init {
+    @Volatile
+    private var isLoaded = false
+
+    @JvmStatic
+    fun loadCustomCore(filePath: String?): Boolean {
+        if (!filePath.isNullOrBlank()) {
+            val f = java.io.File(filePath)
+            if (f.exists() && f.length() > 1024 * 1024) {
+                try {
+                    System.load(f.absolutePath)
+                    isLoaded = true
+                    android.util.Log.i("GoBackend", "Successfully loaded custom rolling core from $filePath")
+                    return true
+                } catch (e: Throwable) {
+                    android.util.Log.w("GoBackend", "Failed to load custom core $filePath, falling back to built-in", e)
+                }
+            }
+        }
+        return ensureLoaded()
+    }
+
+    @JvmStatic
+    fun ensureLoaded(): Boolean {
+        if (isLoaded) return true
         try {
             System.loadLibrary("travonet-wg")
+            isLoaded = true
+            return true
         } catch (e: UnsatisfiedLinkError) {
-            System.loadLibrary("wg-go")
+            try {
+                System.loadLibrary("wg-go")
+                isLoaded = true
+                return true
+            } catch (e2: UnsatisfiedLinkError) {
+                android.util.Log.e("GoBackend", "Failed to load builtin library", e2)
+                return false
+            }
         }
+    }
+
+    init {
+        ensureLoaded()
     }
 
     // --- Защита сокетов через VpnService.protect(fd) ---

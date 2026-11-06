@@ -2,11 +2,15 @@ package com.travonet.wireguard
 
 import android.Manifest
 import android.app.Activity
+import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.net.Uri
 import android.net.VpnService
 import android.os.Build
 import android.os.Bundle
+import android.os.PowerManager
+import android.provider.Settings
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -78,16 +82,15 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    private var uiReceiver: android.content.BroadcastReceiver? = null
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
 
-        // Background warmup of native JNI library to avoid blocking UI rendering
-        Thread {
-            try {
-                Class.forName("org.travonet.backend.GoBackend")
-            } catch (_: Throwable) {}
-        }.start()
+        TunnelManager.init(this)
+        uiReceiver = TunnelManager.registerUiReceiver(this)
+        checkBatteryOptimizationOnce()
 
         setContent {
             TravonetWGTheme {
@@ -132,5 +135,38 @@ class MainActivity : ComponentActivity() {
                 notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
             }
         }
+    }
+
+    private fun checkBatteryOptimizationOnce() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            val prefs = getSharedPreferences("travonet_prefs", Context.MODE_PRIVATE)
+            if (prefs.getBoolean("battery_optimization_prompted", false)) return
+
+            val pm = getSystemService(Context.POWER_SERVICE) as? PowerManager
+            if (pm != null && !pm.isIgnoringBatteryOptimizations(packageName)) {
+                try {
+                    prefs.edit().putBoolean("battery_optimization_prompted", true).apply()
+                    val intent = Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS).apply {
+                        data = Uri.parse("package:$packageName")
+                    }
+                    startActivity(intent)
+                } catch (_: Exception) {}
+            }
+        }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        TunnelManager.queryTunnelState(this)
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        uiReceiver?.let {
+            try {
+                unregisterReceiver(it)
+            } catch (_: Exception) {}
+        }
+        uiReceiver = null
     }
 }

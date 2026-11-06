@@ -39,6 +39,35 @@ object PingHelper {
         }
     }
 
+    fun extractPort(endpoint: String, defaultPort: Int = 443): Int {
+        val trimmed = endpoint.trim()
+        val portStr = when {
+            trimmed.startsWith("[") -> trimmed.substringAfter("]:", "")
+            trimmed.contains(":") -> trimmed.substringAfterLast(":")
+            else -> ""
+        }
+        return portStr.toIntOrNull() ?: defaultPort
+    }
+
+    /**
+     * Быстрый сокет-пинг порта хоста (TCP connect).
+     * Не поднимает нативные ядра и моментально определяет доступность эндпоинта.
+     */
+    suspend fun pingTcpHost(endpoint: String, defaultPort: Int = 443, timeoutMs: Int = 1500): Long? = withContext(Dispatchers.IO) {
+        val host = extractHost(endpoint)
+        if (host.isBlank()) return@withContext null
+        val port = extractPort(endpoint, defaultPort)
+        val start = System.currentTimeMillis()
+        try {
+            Socket().use { socket ->
+                socket.connect(InetSocketAddress(host, port), timeoutMs)
+                System.currentTimeMillis() - start
+            }
+        } catch (_: Exception) {
+            null
+        }
+    }
+
     /**
      * Пинг без рукопожатия (UDP/транспортная доступность хоста).
      * Запускает системный ping до хоста эндпоинта.
@@ -70,10 +99,9 @@ object PingHelper {
     }
 
     /**
-     * Пинг с рукопожатием (HTTP generate_204 через WireGuard + SOCKS5).
+     * Пинг доступности сервиса (HTTP generate_204).
      * Если туннель уже подключен в приложении, использует текущий активный канал.
-     * Если туннель выключен, запускает временный локальный SOCKS5 на свободном порту,
-     * выполняет запрос к gstatic.com/generate_204 и сразу останавливает SOCKS5.
+     * Если туннель выключен, выполняет легкую прямую проверку доступности эндпоинта.
      */
     suspend fun pingHttp204(
         profile: WgProfile,
@@ -86,38 +114,12 @@ object PingHelper {
             return@withContext pingConnectedTunnel(currentStatus.mode)
         }
 
-        // Если туннель выключен: поднимаем временный изолированный SOCKS5 без создания VPN
-        val freePort = try {
-            ServerSocket(0).use { it.localPort }
-        } catch (_: Exception) {
-            11080
-        }
-
-        val preparedConfig = WgConfigParser.prepareConfigForLaunch(profile, strategy)
-        val handle = try {
-            GoBackend.wgStartSocks5("127.0.0.1:$freePort", preparedConfig)
-        } catch (_: Exception) {
-            -1
-        }
-        if (handle < 0) return@withContext null
-
-        try {
-            // Даём ядру 150мс на запуск слушателя и первичный handshake
-            delay(150)
-            var latency = probeSocks5Http204("127.0.0.1", freePort, timeoutMs = 3500)
-            if (latency == null) {
-                delay(200)
-                latency = probeSocks5Http204("127.0.0.1", freePort, timeoutMs = 3500)
-            }
-            latency
-        } finally {
-            try {
-                GoBackend.wgStopSocks5(handle)
-            } catch (_: Exception) {}
-        }
+        // Для выключенного профиля — легкий быстрый TCP/UDP тест без утечек горутин и сокетов
+        return@withContext pingTcpHost(profile.endpoint, timeoutMs = 1500)
+            ?: pingUdpHost(profile.endpoint, timeoutSec = 1)
     }
 
-    private fun pingConnectedTunnel(mode: TunnelMode): Long? {
+    fun pingConnectedTunnel(mode: TunnelMode): Long? {
         return if (mode == TunnelMode.SOCKS5 && TunnelManager.socksHandle >= 0) {
             probeSocks5Http204("127.0.0.1", 1080, timeoutMs = 4000)
         } else {
@@ -200,7 +202,7 @@ object PingHelper {
             input.read(skipBuf)
 
             // 3. Send HTTP request
-            val httpReq = "GET $HTTP_PATH HTTP/1.1\r\nHost: $TARGET_HOST\r\nConnection: close\r\nUser-Agent: TravonetWG/Ping\r\n\r\n"
+            val httpReq = "GET $HTTP_PATH HTTP/1.1\r\nHost: $TARGET_HOST\r\nConnection: close\r\nUser-Agent: TravonetVPN/Ping\r\n\r\n"
             out.write(httpReq.toByteArray(Charsets.US_ASCII))
             out.flush()
 
