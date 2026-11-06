@@ -226,20 +226,26 @@ class TravonetVpnService : VpnService() {
                 Log.w(TAG, "Failed to exclude package from TUN", e)
             }
 
+            builder.allowBypass()
+
             // Add DNS
             var dnsCount = 0
             val dnsMode = repository.getDnsMode()
             val effectiveDns: List<String> = repository.getEffectiveDnsServers()
-            val profileDns = parsed.iface.dnsServers
+            val profileDns = parsed.iface.dnsServers.filter { !isPrivateIp(it.trim()) }
             val dnsServers = when (dnsMode) {
                 DnsMode.SYSTEM -> {
                     val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
-                    val lp = cm?.getLinkProperties(cm?.activeNetwork)
+                    val lp = physicalNetwork?.let { cm?.getLinkProperties(it) } ?: cm?.getLinkProperties(cm?.activeNetwork)
                     val sysList = lp?.dnsServers?.mapNotNull { it.hostAddress } ?: emptyList()
-                    sysList.ifEmpty { profileDns.ifEmpty { listOf("77.88.8.8", "8.8.8.8", "1.1.1.1") } }
+                    val publicSysList = sysList.filter { !isPrivateIp(it.trim()) }
+                    publicSysList.ifEmpty { profileDns.ifEmpty { listOf("77.88.8.8", "8.8.8.8", "1.1.1.1") } }
                 }
-                DnsMode.SERVER -> profileDns.ifEmpty { listOf("1.1.1.1", "1.0.0.1") }
-                DnsMode.CUSTOM -> effectiveDns.ifEmpty { profileDns.ifEmpty { listOf("1.1.1.1", "1.0.0.1") } }
+                DnsMode.SERVER -> profileDns.ifEmpty { listOf("1.1.1.1", "8.8.8.8") }
+                DnsMode.CUSTOM -> {
+                    val custom = effectiveDns.filter { !isPrivateIp(it.trim()) }
+                    custom.ifEmpty { profileDns.ifEmpty { listOf("1.1.1.1", "8.8.8.8") } }
+                }
             }
 
             dnsServers.forEach { dnsStr: String ->
@@ -605,16 +611,20 @@ class TravonetVpnService : VpnService() {
 
             val proxyDnsMode = repository.getDnsMode()
             val proxyEffectiveDns = repository.getEffectiveDnsServers()
-            val proxyProfileDns = parsed?.iface?.dnsServers ?: emptyList()
+            val proxyProfileDns = (parsed?.iface?.dnsServers ?: emptyList()).filter { !isPrivateIp(it.trim()) }
             val proxyDnsServers = when (proxyDnsMode) {
                 DnsMode.SYSTEM -> {
                     val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
-                    val lp = cm?.getLinkProperties(cm?.activeNetwork)
+                    val lp = physicalNetwork?.let { cm?.getLinkProperties(it) } ?: cm?.getLinkProperties(cm?.activeNetwork)
                     val sysList = lp?.dnsServers?.mapNotNull { it.hostAddress } ?: emptyList()
-                    sysList.ifEmpty { proxyProfileDns.ifEmpty { listOf("77.88.8.8", "8.8.8.8", "1.1.1.1") } }
+                    val publicSysList = sysList.filter { !isPrivateIp(it.trim()) }
+                    publicSysList.ifEmpty { proxyProfileDns.ifEmpty { listOf("77.88.8.8", "8.8.8.8", "1.1.1.1") } }
                 }
-                DnsMode.SERVER -> proxyProfileDns.ifEmpty { listOf("1.1.1.1", "1.0.0.1") }
-                DnsMode.CUSTOM -> proxyEffectiveDns.ifEmpty { proxyProfileDns.ifEmpty { listOf("1.1.1.1", "1.0.0.1") } }
+                DnsMode.SERVER -> proxyProfileDns.ifEmpty { listOf("1.1.1.1", "8.8.8.8") }
+                DnsMode.CUSTOM -> {
+                    val custom = proxyEffectiveDns.filter { !isPrivateIp(it.trim()) }
+                    custom.ifEmpty { proxyProfileDns.ifEmpty { listOf("1.1.1.1", "8.8.8.8") } }
+                }
             }
 
             proxyDnsServers.forEach { dnsStr ->
@@ -635,6 +645,8 @@ class TravonetVpnService : VpnService() {
             } catch (e: Exception) {
                 Log.w(TAG, "Failed to exclude package from TUN", e)
             }
+
+            builder.allowBypass()
 
             val currentPfd = builder.establish()
             if (currentPfd == null) {
@@ -753,18 +765,20 @@ class TravonetVpnService : VpnService() {
             .addAddress("172.19.0.1", 30)
             .addRoute("0.0.0.0", 0)
 
+        builder.allowBypass()
+
         val effectiveDns: List<String> = repository.getEffectiveDnsServers()
         val builderDns = when (dnsMode) {
             DnsMode.SYSTEM -> {
                 val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
-                val lp = cm?.getLinkProperties(cm?.activeNetwork)
+                val lp = physicalNetwork?.let { cm?.getLinkProperties(it) } ?: cm?.getLinkProperties(cm?.activeNetwork)
                 val sysList = lp?.dnsServers?.mapNotNull { it.hostAddress } ?: emptyList()
-                val filtered = sysList.filter { !it.contains(":") }
+                val filtered = sysList.filter { !it.contains(":") && !isPrivateIp(it.trim()) }
                 if (filtered.isNotEmpty()) listOf("172.19.0.2") + filtered else listOf("172.19.0.2", "77.88.8.8", "1.1.1.1")
             }
             DnsMode.SERVER -> listOf("172.19.0.2", "1.1.1.1", "8.8.8.8")
             DnsMode.CUSTOM -> {
-                val custom = effectiveDns.filter { !it.contains(":") }
+                val custom = effectiveDns.filter { !it.contains(":") && !isPrivateIp(it.trim()) }
                 if (custom.isNotEmpty()) listOf("172.19.0.2") + custom else listOf("172.19.0.2", "1.1.1.1")
             }
         }

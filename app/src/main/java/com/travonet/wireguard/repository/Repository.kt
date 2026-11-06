@@ -331,8 +331,8 @@ class AppRepository(context: Context) {
         if (!raw.isNullOrBlank()) {
             runCatching { DnsMode.valueOf(raw) }.getOrNull()?.let { return it }
         }
-        // Migration from the old "global DNS" checkbox.
-        return if (isOverrideDns()) DnsMode.CUSTOM else DnsMode.SYSTEM
+        // Default to SERVER (DNS through VPN tunnel) for security and reliability.
+        return if (isOverrideDns()) DnsMode.CUSTOM else DnsMode.SERVER
     }
 
     fun setDnsMode(mode: DnsMode) {
