@@ -594,9 +594,14 @@ fun MainScreen(
             isShowAddresses = showAddresses,
             currentDnsPreset = repository.getDnsPreset(),
             currentCustomDns = repository.getCustomDns(),
-            isOverrideDns = repository.isOverrideDns(),
+            currentDnsMode = repository.getDnsMode(),
+            currentCustomDnsType = repository.getCustomDnsType(),
+            currentCustomDnsUdp = repository.getCustomDnsUdp(),
+            currentCustomDnsDot = repository.getCustomDnsDot(),
+            currentCustomDnsDoh = repository.getCustomDnsDoh(),
+            currentCustomHosts = repository.getCustomHosts(),
             onDismiss = { showSettingsDialog = false },
-            onSave = { newSocksAddr, relayMode, relayUrl, relayToken, fgService, wakeLock, autoReconnect, newShowAddresses, dnsPreset, customDns, overrideDns ->
+            onSave = { newSocksAddr, relayMode, relayUrl, relayToken, fgService, wakeLock, autoReconnect, newShowAddresses, dnsPreset, customDns, newDnsMode, customDnsType, customDnsUdp, customDnsDot, customDnsDoh, customHosts ->
                 socksAddr = newSocksAddr
                 repository.setSocksListenAddr(newSocksAddr)
                 repository.saveWarpRelaySettings(relayMode, relayUrl, relayToken)
@@ -606,7 +611,12 @@ fun MainScreen(
                 repository.setShowAddressesEnabled(newShowAddresses)
                 repository.setDnsPreset(dnsPreset)
                 repository.setCustomDns(customDns)
-                repository.setOverrideDns(overrideDns)
+                repository.setDnsMode(newDnsMode)
+                repository.setCustomDnsType(customDnsType)
+                repository.setCustomDnsUdp(customDnsUdp)
+                repository.setCustomDnsDot(customDnsDot)
+                repository.setCustomDnsDoh(customDnsDoh)
+                repository.setCustomHosts(customHosts)
                 showAddresses = newShowAddresses
                 warpRelayMode = repository.getWarpRelayMode()
                 warpRelayUrl = repository.getWarpRelayUrl()

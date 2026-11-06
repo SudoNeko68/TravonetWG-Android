@@ -881,6 +881,104 @@ class TravonetUnitTest {
     }
 
     @Test
+    fun testSingboxConfigHasDomainResolverForOutboundServer() {
+        val hy2Link = "hysteria2://secret@proxy.example.com:443?sni=proxy.example.com#TestHy2"
+
+        val vpn = org.json.JSONObject(
+            com.travonet.wireguard.parser.ProxyConfigSynthesizer.synthesize(
+                hy2Link,
+                com.travonet.wireguard.core.CoreType.SINGBOX,
+                com.travonet.wireguard.model.TunnelMode.VPN
+            )
+        )
+        assertEquals(
+            "direct-dns",
+            vpn.getJSONObject("route").getString("default_domain_resolver")
+        )
+        assertTrue(hasDnsServerTag(vpn, "direct-dns"))
+        assertFalse(hasOutboundDnsRule(vpn))
+
+        val socks = org.json.JSONObject(
+            com.travonet.wireguard.parser.ProxyConfigSynthesizer.synthesize(
+                hy2Link,
+                com.travonet.wireguard.core.CoreType.SINGBOX,
+                com.travonet.wireguard.model.TunnelMode.SOCKS5
+            )
+        )
+        assertEquals(
+            "direct-dns",
+            socks.getJSONObject("route").getString("default_domain_resolver")
+        )
+        assertTrue(hasDnsServerTag(socks, "direct-dns"))
+    }
+
+    @Test
+    fun testRawSingboxConfigMigratesLegacyOutboundDnsRules() {
+        val raw = """
+            {
+              "inbounds": [{"type": "tun", "tag": "tun-in", "address": ["172.19.0.1/30"]}],
+              "dns": {
+                "servers": [
+                  {"tag": "remote-dns", "type": "https", "server": "1.1.1.1", "detour": "proxy", "path": "/dns-query"},
+                  {"tag": "direct-dns", "type": "local", "detour": "direct"}
+                ],
+                "rules": [{"outbound": ["any"], "server": "direct-dns"}]
+              },
+              "route": {"rules": [{"inbound": "tun-in", "outbound": "proxy"}]},
+              "outbounds": [{"type": "hysteria2", "tag": "proxy", "server": "proxy.example.com", "server_port": 443}]
+            }
+        """.trimIndent()
+
+        val out = org.json.JSONObject(
+            com.travonet.wireguard.parser.ProxyConfigSynthesizer.synthesize(
+                raw,
+                com.travonet.wireguard.core.CoreType.SINGBOX,
+                com.travonet.wireguard.model.TunnelMode.VPN
+            )
+        )
+        assertEquals(
+            "direct-dns",
+            out.getJSONObject("route").getString("default_domain_resolver")
+        )
+        assertTrue(hasDnsServerTag(out, "direct-dns"))
+        assertFalse(hasOutboundDnsRule(out))
+    }
+
+    @Test
+    fun testRawSingboxConfigWithoutDnsGetsDirectResolver() {
+        val raw = """{"outbounds":[{"type":"vless","tag":"proxy","server":"proxy.example.com","server_port":443}]}"""
+
+        val out = org.json.JSONObject(
+            com.travonet.wireguard.parser.ProxyConfigSynthesizer.synthesize(
+                raw,
+                com.travonet.wireguard.core.CoreType.SINGBOX,
+                com.travonet.wireguard.model.TunnelMode.SOCKS5
+            )
+        )
+        assertEquals(
+            "direct-dns",
+            out.getJSONObject("route").getString("default_domain_resolver")
+        )
+        assertTrue(hasDnsServerTag(out, "direct-dns"))
+    }
+
+    private fun hasDnsServerTag(config: org.json.JSONObject, tag: String): Boolean {
+        val servers = config.optJSONObject("dns")?.optJSONArray("servers") ?: return false
+        for (i in 0 until servers.length()) {
+            if (servers.optJSONObject(i)?.optString("tag") == tag) return true
+        }
+        return false
+    }
+
+    private fun hasOutboundDnsRule(config: org.json.JSONObject): Boolean {
+        val rules = config.optJSONObject("dns")?.optJSONArray("rules") ?: return false
+        for (i in 0 until rules.length()) {
+            if (rules.optJSONObject(i)?.has("outbound") == true) return true
+        }
+        return false
+    }
+
+    @Test
     fun testTunAndSocksConfigSynthesis() {
         val vlessLink = "vless://b831381d-6324-4d53-ad4f-8cda48b30811@1.2.3.4:443?encryption=none&security=reality&type=tcp&sni=yahoo.com&fp=chrome&pbk=12345&sid=abcd#TestVless"
 

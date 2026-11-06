@@ -18,6 +18,7 @@ import com.travonet.wireguard.R
 import com.travonet.wireguard.core.CoreManager
 import com.travonet.wireguard.core.CoreRouter
 import com.travonet.wireguard.core.CoreType
+import com.travonet.wireguard.model.DnsMode
 import com.travonet.wireguard.model.TunnelMode
 import com.travonet.wireguard.model.TunnelStatus
 import com.travonet.wireguard.parser.ProxyConfigSynthesizer
@@ -177,13 +178,17 @@ class TravonetSocksService : Service() {
                     }
 
                     val dohUrl = repository.getEffectiveDnsDohUrl()
+                    val dnsMode = repository.getDnsMode()
+                    val customHosts = repository.getCustomHosts()
                     val configJson = try {
                         ProxyConfigSynthesizer.synthesize(
                             profile.rawConfig,
                             targetCore,
                             mode = TunnelMode.SOCKS5,
                             socksListen = listenAddr,
-                            dohUrl = dohUrl
+                            dohUrl = dohUrl,
+                            dnsMode = dnsMode,
+                            customHosts = customHosts
                         )
                     } catch (e: Exception) {
                         Log.e(TAG, "Failed to synthesize proxy config for SOCKS5", e)

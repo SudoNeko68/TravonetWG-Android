@@ -10,6 +10,7 @@ import android.content.pm.ServiceInfo
 import android.net.ConnectivityManager
 import android.net.Network
 import android.net.NetworkCapabilities
+import android.net.NetworkRequest
 import android.net.VpnService
 import android.os.Build
 import android.os.ParcelFileDescriptor
@@ -19,6 +20,7 @@ import android.util.Log
 import androidx.core.app.NotificationCompat
 import com.travonet.wireguard.MainActivity
 import com.travonet.wireguard.R
+import com.travonet.wireguard.model.DnsMode
 import com.travonet.wireguard.model.TunnelMode
 import com.travonet.wireguard.model.TunnelStatus
 import com.travonet.wireguard.parser.WgConfigParser
@@ -223,44 +225,31 @@ class TravonetVpnService : VpnService() {
 
             // Add DNS
             var dnsCount = 0
-            val overrideDns = repository.isOverrideDns()
+            val dnsMode = repository.getDnsMode()
             val effectiveDns: List<String> = repository.getEffectiveDnsServers()
-
-            if (overrideDns && effectiveDns.isNotEmpty()) {
-                effectiveDns.forEach { dnsStr: String ->
-                    try {
-                        val dns = dnsStr.trim()
-                        val isV6 = dns.contains(":")
-                        if (!isV6 || hasIpv6) {
-                            builder.addDnsServer(dns)
-                            dnsCount++
-                        }
-                    } catch (e: Exception) {
-                        Log.w(TAG, "Failed to add override DNS: $dnsStr", e)
-                    }
+            val profileDns = parsed.iface.dnsServers
+            val dnsServers = when (dnsMode) {
+                DnsMode.SYSTEM -> {
+                    val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
+                    val lp = cm?.getLinkProperties(cm?.activeNetwork)
+                    val sysList = lp?.dnsServers?.mapNotNull { it.hostAddress } ?: emptyList()
+                    sysList.ifEmpty { profileDns.ifEmpty { listOf("1.1.1.1", "8.8.8.8") } }
                 }
-            } else {
-                parsed.iface.dnsServers.forEach { dnsStr: String ->
-                    try {
-                        val dns = dnsStr.trim()
-                        val isV6 = dns.contains(":")
-                        if (isV6 && !hasIpv6) {
-                            return@forEach
-                        }
-                        builder.addDnsServer(dns)
-                        dnsCount++
-                    } catch (e: Exception) {
-                        Log.w(TAG, "Failed to add DNS: $dnsStr", e)
-                    }
-                }
+                DnsMode.SERVER -> profileDns.ifEmpty { listOf("1.1.1.1", "1.0.0.1") }
+                DnsMode.CUSTOM -> effectiveDns.ifEmpty { profileDns.ifEmpty { listOf("1.1.1.1", "1.0.0.1") } }
             }
 
-            if (dnsCount == 0) {
-                if (effectiveDns.isNotEmpty()) {
-                    effectiveDns.forEach { dns: String -> try { builder.addDnsServer(dns) } catch (_: Exception) {} }
-                } else {
-                    builder.addDnsServer("1.1.1.1")
-                    builder.addDnsServer("8.8.8.8")
+            dnsServers.forEach { dnsStr: String ->
+                try {
+                    val dns = dnsStr.trim()
+                    val isV6 = dns.contains(":")
+                    if (isV6 && !hasIpv6) {
+                        return@forEach
+                    }
+                    builder.addDnsServer(dns)
+                    dnsCount++
+                } catch (e: Exception) {
+                    Log.w(TAG, "Failed to add DNS: $dnsStr", e)
                 }
             }
 
@@ -273,13 +262,6 @@ class TravonetVpnService : VpnService() {
             activePfd = currentPfd
             val tunFd = currentPfd.detachFd()
 
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
-                val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
-                val activeNet = cm?.activeNetwork
-                if (activeNet != null) {
-                    setUnderlyingNetworks(arrayOf(activeNet))
-                }
-            }
             registerNetworkCallback()
 
             // wgTurnOnProtected применяет VpnService.protect(fd) к каждому
@@ -651,13 +633,6 @@ class TravonetVpnService : VpnService() {
             activePfd = currentPfd
             tunFd = currentPfd.detachFd()
             activeTunFd = tunFd
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
-                val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
-                val activeNet = cm?.activeNetwork
-                if (activeNet != null) {
-                    setUnderlyingNetworks(arrayOf(activeNet))
-                }
-            }
             registerNetworkCallback()
         }
 
@@ -740,12 +715,16 @@ class TravonetVpnService : VpnService() {
         }
 
         val dohUrl = repository.getEffectiveDnsDohUrl()
+        val dnsMode = repository.getDnsMode()
+        val customHosts = repository.getCustomHosts()
         val configJson = try {
             com.travonet.wireguard.parser.ProxyConfigSynthesizer.synthesize(
                 profile.rawConfig,
                 targetCore,
                 mode = com.travonet.wireguard.model.TunnelMode.VPN,
-                dohUrl = dohUrl
+                dohUrl = dohUrl,
+                dnsMode = dnsMode,
+                customHosts = customHosts
             ).also { Log.d(TAG, "Synthesized proxy config:\n$it") }
         } catch (e: Exception) {
             Log.e(TAG, "Failed to synthesize proxy config", e)
@@ -766,24 +745,20 @@ class TravonetVpnService : VpnService() {
             .addRoute("0.0.0.0", 0)
 
         val effectiveDns: List<String> = repository.getEffectiveDnsServers()
-        if (effectiveDns.isNotEmpty()) {
-            effectiveDns.forEach { dns: String -> try { builder.addDnsServer(dns) } catch (_: Exception) {} }
-        } else {
-            builder.addDnsServer("1.1.1.1")
-            builder.addDnsServer("8.8.8.8")
+        val builderDns = when (dnsMode) {
+            DnsMode.SYSTEM -> {
+                val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
+                val lp = cm?.getLinkProperties(cm?.activeNetwork)
+                val sysList = lp?.dnsServers?.mapNotNull { it.hostAddress } ?: emptyList()
+                sysList.ifEmpty { listOf("1.1.1.1", "8.8.8.8") }
+            }
+            DnsMode.SERVER -> listOf("1.1.1.1", "1.0.0.1")
+            DnsMode.CUSTOM -> effectiveDns.ifEmpty { listOf("1.1.1.1", "1.0.0.1") }
         }
-
-        try {
-            builder.addAddress("fdfe:dcba:9876::1", 126)
-            builder.addRoute("::", 0)
-            builder.addDnsServer("2606:4700:4700::1111")
-        } catch (e: Exception) {
-            Log.w(TAG, "IPv6 address/route not supported: ${e.message}")
-        }
+        builderDns.forEach { dns: String -> try { builder.addDnsServer(dns) } catch (_: Exception) {} }
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             builder.allowFamily(android.system.OsConstants.AF_INET)
-            builder.allowFamily(android.system.OsConstants.AF_INET6)
             builder.setMetered(false)
         }
 
@@ -804,13 +779,6 @@ class TravonetVpnService : VpnService() {
         val tunFd = currentPfd.detachFd()
         activeTunFd = tunFd
 
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
-            val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
-            val activeNet = cm?.activeNetwork
-            if (activeNet != null) {
-                setUnderlyingNetworks(arrayOf(activeNet))
-            }
-        }
         registerNetworkCallback()
 
         val started = com.freevpn.coreloader.NativeCoreBridge.startProxyWithCore(corePath, configJson, tunFd)
@@ -1061,35 +1029,58 @@ class TravonetVpnService : VpnService() {
         super.onDestroy()
     }
 
+    private fun updateUnderlyingNetworks() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.P) return
+        val cm = connectivityManager ?: (getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager) ?: return
+        try {
+            val physicalNetworks = cm.allNetworks.filter { net ->
+                val caps = cm.getNetworkCapabilities(net)
+                caps != null &&
+                        caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) &&
+                        caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN)
+            }
+            if (physicalNetworks.isNotEmpty()) {
+                setUnderlyingNetworks(physicalNetworks.toTypedArray())
+            } else {
+                setUnderlyingNetworks(null)
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to update underlying networks", e)
+            try { setUnderlyingNetworks(null) } catch (_: Exception) {}
+        }
+    }
+
     private fun registerNetworkCallback() {
-        if (defaultNetworkCallback != null) return
+        if (defaultNetworkCallback != null) {
+            updateUnderlyingNetworks()
+            return
+        }
         val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager ?: return
         connectivityManager = cm
+        val request = NetworkRequest.Builder()
+            .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+            .addCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN)
+            .build()
         val callback = object : ConnectivityManager.NetworkCallback() {
             override fun onAvailable(network: Network) {
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
-                    setUnderlyingNetworks(arrayOf(network))
-                }
+                updateUnderlyingNetworks()
             }
 
             override fun onLost(network: Network) {
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
-                    setUnderlyingNetworks(null)
-                }
+                updateUnderlyingNetworks()
             }
 
             override fun onCapabilitiesChanged(network: Network, networkCapabilities: NetworkCapabilities) {
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
-                    setUnderlyingNetworks(arrayOf(network))
-                }
+                updateUnderlyingNetworks()
             }
         }
         try {
-            cm.registerDefaultNetworkCallback(callback)
+            cm.registerNetworkCallback(request, callback)
             defaultNetworkCallback = callback
         } catch (e: Exception) {
-            Log.w(TAG, "Failed to register default network callback", e)
+            Log.w(TAG, "Failed to register network callback", e)
         }
+        updateUnderlyingNetworks()
     }
 
     private fun unregisterNetworkCallback() {

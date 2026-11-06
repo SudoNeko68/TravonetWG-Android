@@ -4,6 +4,7 @@ import android.content.Context
 import android.content.SharedPreferences
 import com.travonet.wireguard.BuildConfig
 import com.travonet.wireguard.model.DefaultStrategies
+import com.travonet.wireguard.model.DnsMode
 import com.travonet.wireguard.model.EvasionStrategy
 import com.travonet.wireguard.model.Subscription
 import com.travonet.wireguard.model.TunnelMode
@@ -325,6 +326,22 @@ class AppRepository(context: Context) {
     }
 
     // Global DNS Settings
+    fun getDnsMode(): DnsMode {
+        val raw = prefs.getString("dns_mode", null)
+        if (!raw.isNullOrBlank()) {
+            runCatching { DnsMode.valueOf(raw) }.getOrNull()?.let { return it }
+        }
+        // Migration from the old "global DNS" checkbox.
+        return if (isOverrideDns()) DnsMode.CUSTOM else DnsMode.SYSTEM
+    }
+
+    fun setDnsMode(mode: DnsMode) {
+        prefs.edit()
+            .putString("dns_mode", mode.name)
+            .putBoolean("override_dns_enabled", mode != DnsMode.SYSTEM)
+            .apply()
+    }
+
     fun getDnsPreset(): String {
         return prefs.getString("dns_preset", "cloudflare") ?: "cloudflare"
     }
@@ -341,6 +358,46 @@ class AppRepository(context: Context) {
         prefs.edit().putString("custom_dns", customDns.trim()).apply()
     }
 
+    fun getCustomDnsType(): String {
+        return prefs.getString("custom_dns_type", "DOH") ?: "DOH"
+    }
+
+    fun setCustomDnsType(type: String) {
+        prefs.edit().putString("custom_dns_type", type.uppercase()).apply()
+    }
+
+    fun getCustomDnsUdp(): String {
+        return prefs.getString("custom_dns_udp", "1.1.1.1, 1.0.0.1") ?: "1.1.1.1, 1.0.0.1"
+    }
+
+    fun setCustomDnsUdp(value: String) {
+        prefs.edit().putString("custom_dns_udp", value.trim()).apply()
+    }
+
+    fun getCustomDnsDot(): String {
+        return prefs.getString("custom_dns_dot", "tls://1.1.1.1:853") ?: "tls://1.1.1.1:853"
+    }
+
+    fun setCustomDnsDot(value: String) {
+        prefs.edit().putString("custom_dns_dot", value.trim()).apply()
+    }
+
+    fun getCustomDnsDoh(): String {
+        return prefs.getString("custom_dns_doh", "https://1.1.1.1/dns-query") ?: "https://1.1.1.1/dns-query"
+    }
+
+    fun setCustomDnsDoh(value: String) {
+        prefs.edit().putString("custom_dns_doh", value.trim()).apply()
+    }
+
+    fun getCustomHosts(): String {
+        return prefs.getString("custom_hosts", "") ?: ""
+    }
+
+    fun setCustomHosts(value: String) {
+        prefs.edit().putString("custom_hosts", value).apply()
+    }
+
     fun isOverrideDns(): Boolean {
         return prefs.getBoolean("override_dns_enabled", false)
     }
@@ -350,17 +407,30 @@ class AppRepository(context: Context) {
     }
 
     fun getEffectiveDnsServers(): List<String> {
+        when (getDnsMode()) {
+            DnsMode.SYSTEM -> return emptyList()
+            DnsMode.SERVER -> return listOf("1.1.1.1", "1.0.0.1")
+            DnsMode.CUSTOM -> Unit
+        }
+        val udpList = getCustomDnsUdp().split(",", " ", ";")
+            .map { it.trim() }
+            .filter { it.isNotEmpty() && !it.startsWith("http", ignoreCase = true) && !it.startsWith("tls", ignoreCase = true) }
+        val fallbackUdp = if (udpList.isNotEmpty()) udpList else listOf("1.1.1.1", "1.0.0.1")
+
         return when (getDnsPreset().lowercase()) {
             "cloudflare" -> listOf("1.1.1.1", "1.0.0.1")
             "google" -> listOf("8.8.8.8", "8.8.4.4")
             "adguard" -> listOf("94.140.14.14", "94.140.15.15")
             "quad9" -> listOf("9.9.9.9", "149.112.112.112")
             "custom" -> {
-                val raw = getCustomDns()
-                val list = raw.split(",", " ", ";")
-                    .map { it.trim() }
-                    .filter { it.isNotEmpty() && !it.startsWith("http", ignoreCase = true) }
-                if (list.isNotEmpty()) list else listOf("1.1.1.1", "8.8.8.8")
+                when (getCustomDnsType().uppercase()) {
+                    "UDP" -> fallbackUdp
+                    "DOT" -> {
+                        val dot = getCustomDnsDot().removePrefix("tls://").substringBefore(':').substringBefore('/')
+                        if (dot.matches(Regex("\\d+\\.\\d+\\.\\d+\\.\\d+"))) listOf(dot) else fallbackUdp
+                    }
+                    else -> fallbackUdp
+                }
             }
             "system" -> emptyList()
             else -> listOf("1.1.1.1", "1.0.0.1")
@@ -368,21 +438,33 @@ class AppRepository(context: Context) {
     }
 
     fun getEffectiveDnsDohUrl(): String {
+        when (getDnsMode()) {
+            DnsMode.SYSTEM -> return "local"
+            DnsMode.SERVER -> return "https://1.1.1.1/dns-query"
+            DnsMode.CUSTOM -> Unit
+        }
+        if (getDnsPreset().lowercase() == "custom") {
+            return when (getCustomDnsType().uppercase()) {
+                "UDP" -> {
+                    val rawUdp = getCustomDnsUdp().trim()
+                    val firstIp = rawUdp.split(",", " ", ";").firstOrNull { it.isNotBlank() } ?: "1.1.1.1"
+                    "udp://$firstIp"
+                }
+                "DOT" -> {
+                    val rawDot = getCustomDnsDot().trim()
+                    if (rawDot.startsWith("tls://", ignoreCase = true)) rawDot else "tls://$rawDot"
+                }
+                else -> {
+                    val rawDoh = getCustomDnsDoh().trim()
+                    if (rawDoh.startsWith("https://", ignoreCase = true)) rawDoh else "https://$rawDoh"
+                }
+            }
+        }
         return when (getDnsPreset().lowercase()) {
             "cloudflare" -> "https://1.1.1.1/dns-query"
             "google" -> "https://dns.google/dns-query"
             "adguard" -> "https://dns.adguard-dns.com/dns-query"
             "quad9" -> "https://dns.quad9.net/dns-query"
-            "custom" -> {
-                val raw = getCustomDns().trim()
-                if (raw.startsWith("https://", ignoreCase = true) || raw.startsWith("tcp://", ignoreCase = true) ||
-                    raw.startsWith("tls://", ignoreCase = true) || raw.startsWith("udp://", ignoreCase = true)) {
-                    raw
-                } else {
-                    val firstIp = raw.split(",", " ", ";").firstOrNull { it.isNotBlank() } ?: "1.1.1.1"
-                    "udp://$firstIp"
-                }
-            }
             "system" -> "local"
             else -> "https://1.1.1.1/dns-query"
         }
