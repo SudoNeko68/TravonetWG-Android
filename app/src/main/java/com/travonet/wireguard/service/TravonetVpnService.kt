@@ -54,6 +54,7 @@ class TravonetVpnService : VpnService() {
     @Volatile private var destroyed = false
     @Volatile private var isProxyActive = false
     private var wakeLock: PowerManager.WakeLock? = null
+    private val repository by lazy { AppRepository(this) }
 
     companion object {
         const val TAG = "TravonetVPN"
@@ -65,8 +66,12 @@ class TravonetVpnService : VpnService() {
         private const val HANDSHAKE_TIMEOUT_MS = 45_000L
     }
 
+    private var serviceReceiver: android.content.BroadcastReceiver? = null
+
     override fun onCreate() {
         super.onCreate()
+        TunnelManager.init(this)
+        serviceReceiver = TunnelManager.registerServiceReceiver(this)
         createNotificationChannel()
         com.freevpn.coreloader.NativeCoreBridge.setCoreEventListener(object : com.freevpn.coreloader.CoreEventListener {
             override fun onCoreEvent(eventType: Int, payload: String) {
@@ -92,7 +97,6 @@ class TravonetVpnService : VpnService() {
 
         if (action == ACTION_START) {
             val profileId = intent.getStringExtra(EXTRA_PROFILE_ID)
-            val repository = AppRepository(this)
             val profile = repository.getProfiles().firstOrNull { it.id == profileId }
                 ?: repository.getSelectedProfile()
 
@@ -112,6 +116,7 @@ class TravonetVpnService : VpnService() {
                     startTunnelLocked(profile, strategy, 0)
                 }
             }
+            return START_REDELIVER_INTENT
         }
 
         return START_NOT_STICKY
@@ -203,30 +208,60 @@ class TravonetVpnService : VpnService() {
                 if (hasIpv6) builder.addRoute("::", 0)
             }
 
-            builder.allowFamily(OsConstants.AF_INET)
-            if (!hasIpv6) {
-                builder.allowFamily(OsConstants.AF_INET6)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                builder.allowFamily(OsConstants.AF_INET)
+                if (hasIpv6) {
+                    builder.allowFamily(OsConstants.AF_INET6)
+                }
+            }
+
+            try {
+                builder.addDisallowedApplication(packageName)
+            } catch (e: Exception) {
+                Log.w(TAG, "Failed to exclude package from TUN", e)
             }
 
             // Add DNS
             var dnsCount = 0
-            parsed.iface.dnsServers.forEach { dnsStr ->
-                try {
-                    val dns = dnsStr.trim()
-                    val isV6 = dns.contains(":")
-                    if (isV6 && !hasIpv6) {
-                        return@forEach
+            val overrideDns = repository.isOverrideDns()
+            val effectiveDns: List<String> = repository.getEffectiveDnsServers()
+
+            if (overrideDns && effectiveDns.isNotEmpty()) {
+                effectiveDns.forEach { dnsStr: String ->
+                    try {
+                        val dns = dnsStr.trim()
+                        val isV6 = dns.contains(":")
+                        if (!isV6 || hasIpv6) {
+                            builder.addDnsServer(dns)
+                            dnsCount++
+                        }
+                    } catch (e: Exception) {
+                        Log.w(TAG, "Failed to add override DNS: $dnsStr", e)
                     }
-                    builder.addDnsServer(dns)
-                    dnsCount++
-                } catch (e: Exception) {
-                    Log.w(TAG, "Failed to add DNS: $dnsStr", e)
+                }
+            } else {
+                parsed.iface.dnsServers.forEach { dnsStr: String ->
+                    try {
+                        val dns = dnsStr.trim()
+                        val isV6 = dns.contains(":")
+                        if (isV6 && !hasIpv6) {
+                            return@forEach
+                        }
+                        builder.addDnsServer(dns)
+                        dnsCount++
+                    } catch (e: Exception) {
+                        Log.w(TAG, "Failed to add DNS: $dnsStr", e)
+                    }
                 }
             }
 
             if (dnsCount == 0) {
-                builder.addDnsServer("1.1.1.1")
-                builder.addDnsServer("8.8.8.8")
+                if (effectiveDns.isNotEmpty()) {
+                    effectiveDns.forEach { dns: String -> try { builder.addDnsServer(dns) } catch (_: Exception) {} }
+                } else {
+                    builder.addDnsServer("1.1.1.1")
+                    builder.addDnsServer("8.8.8.8")
+                }
             }
 
             val currentPfd = builder.establish()
@@ -239,7 +274,11 @@ class TravonetVpnService : VpnService() {
             val tunFd = currentPfd.detachFd()
 
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
-                setUnderlyingNetworks(null)
+                val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
+                val activeNet = cm?.activeNetwork
+                if (activeNet != null) {
+                    setUnderlyingNetworks(arrayOf(activeNet))
+                }
             }
             registerNetworkCallback()
 
@@ -572,8 +611,12 @@ class TravonetVpnService : VpnService() {
                 if (hasIpv6) builder.addRoute("::", 0)
             }
 
-            builder.allowFamily(android.system.OsConstants.AF_INET)
-            builder.allowFamily(android.system.OsConstants.AF_INET6)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                builder.allowFamily(android.system.OsConstants.AF_INET)
+                if (hasIpv6) {
+                    builder.allowFamily(android.system.OsConstants.AF_INET6)
+                }
+            }
 
             parsed?.iface?.dnsServers?.forEach { dnsStr ->
                 try {
@@ -609,7 +652,11 @@ class TravonetVpnService : VpnService() {
             tunFd = currentPfd.detachFd()
             activeTunFd = tunFd
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
-                setUnderlyingNetworks(null)
+                val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
+                val activeNet = cm?.activeNetwork
+                if (activeNet != null) {
+                    setUnderlyingNetworks(arrayOf(activeNet))
+                }
             }
             registerNetworkCallback()
         }
@@ -692,12 +739,14 @@ class TravonetVpnService : VpnService() {
             return
         }
 
+        val dohUrl = repository.getEffectiveDnsDohUrl()
         val configJson = try {
             com.travonet.wireguard.parser.ProxyConfigSynthesizer.synthesize(
                 profile.rawConfig,
                 targetCore,
-                mode = com.travonet.wireguard.model.TunnelMode.VPN
-            )
+                mode = com.travonet.wireguard.model.TunnelMode.VPN,
+                dohUrl = dohUrl
+            ).also { Log.d(TAG, "Synthesized proxy config:\n$it") }
         } catch (e: Exception) {
             Log.e(TAG, "Failed to synthesize proxy config", e)
             TunnelManager.updateState(
@@ -715,8 +764,14 @@ class TravonetVpnService : VpnService() {
             .setBlocking(true)
             .addAddress("172.19.0.1", 30)
             .addRoute("0.0.0.0", 0)
-            .addDnsServer("1.1.1.1")
-            .addDnsServer("8.8.8.8")
+
+        val effectiveDns: List<String> = repository.getEffectiveDnsServers()
+        if (effectiveDns.isNotEmpty()) {
+            effectiveDns.forEach { dns: String -> try { builder.addDnsServer(dns) } catch (_: Exception) {} }
+        } else {
+            builder.addDnsServer("1.1.1.1")
+            builder.addDnsServer("8.8.8.8")
+        }
 
         try {
             builder.addAddress("fdfe:dcba:9876::1", 126)
@@ -726,10 +781,9 @@ class TravonetVpnService : VpnService() {
             Log.w(TAG, "IPv6 address/route not supported: ${e.message}")
         }
 
-        builder.allowFamily(android.system.OsConstants.AF_INET)
-        builder.allowFamily(android.system.OsConstants.AF_INET6)
-
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            builder.allowFamily(android.system.OsConstants.AF_INET)
+            builder.allowFamily(android.system.OsConstants.AF_INET6)
             builder.setMetered(false)
         }
 
@@ -751,7 +805,11 @@ class TravonetVpnService : VpnService() {
         activeTunFd = tunFd
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
-            setUnderlyingNetworks(null)
+            val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
+            val activeNet = cm?.activeNetwork
+            if (activeNet != null) {
+                setUnderlyingNetworks(arrayOf(activeNet))
+            }
         }
         registerNetworkCallback()
 
@@ -994,6 +1052,12 @@ class TravonetVpnService : VpnService() {
         destroyed = true
         startJob?.cancel()
         releaseTunnelLocked()
+        serviceReceiver?.let {
+            try {
+                unregisterReceiver(it)
+            } catch (_: Exception) {}
+        }
+        serviceReceiver = null
         super.onDestroy()
     }
 

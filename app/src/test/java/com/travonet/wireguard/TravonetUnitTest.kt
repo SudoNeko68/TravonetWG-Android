@@ -535,6 +535,13 @@ class TravonetUnitTest {
         assertEquals(com.travonet.wireguard.core.CoreType.SINGBOX, com.travonet.wireguard.core.CoreRouter.route(hy2ShortUri).targetCore)
         assertEquals(com.travonet.wireguard.core.CoreType.SINGBOX, com.travonet.wireguard.core.CoreRouter.route(shadowtlsUri).targetCore)
 
+        val hy2Json = "{\"outbounds\": [{\"type\": \"hysteria2\", \"server\": \"hy2.example.com\"}]}"
+        val hy1Json = "{\"outbounds\": [{\"type\": \"hysteria\", \"server\": \"hy1.example.com\"}]}"
+        val tuicJson = "{\"outbounds\": [{\"type\": \"tuic\", \"server\": \"tuic.example.com\"}]}"
+        assertEquals(com.travonet.wireguard.core.SupportedProtocol.HYSTERIA2.displayName, com.travonet.wireguard.core.CoreRouter.route(hy2Json).detectedProtocol)
+        assertEquals(com.travonet.wireguard.core.SupportedProtocol.HYSTERIA2.displayName, com.travonet.wireguard.core.CoreRouter.route(hy1Json).detectedProtocol)
+        assertEquals(com.travonet.wireguard.core.SupportedProtocol.TUIC.displayName, com.travonet.wireguard.core.CoreRouter.route(tuicJson).detectedProtocol)
+
         // 4. Custom User Delegations
         val customMap = mapOf(
             com.travonet.wireguard.core.SupportedProtocol.VLESS.id to com.travonet.wireguard.core.CoreType.SINGBOX.id,
@@ -641,6 +648,20 @@ class TravonetUnitTest {
         )
         assertTrue(hy2Config.contains("\"type\": \"hysteria2\"") || hy2Config.contains("\"type\":\"hysteria2\""))
         assertTrue(hy2Config.contains("superpass"))
+
+        val hy2AdvancedUrl = "hy2://my%20secret@hy2.server.com:8443/?sni=cdn.example.com&obfs=salamander&obfs-password=salapass&mport=20000-30000&up=50m&down=100m&insecure=1#AdvHy2"
+        val hy2AdvConfig = com.travonet.wireguard.parser.ProxyConfigSynthesizer.synthesize(
+            hy2AdvancedUrl,
+            com.travonet.wireguard.core.CoreType.SINGBOX
+        )
+        assertTrue(hy2AdvConfig.contains("\"server\": \"hy2.server.com\""))
+        assertTrue(hy2AdvConfig.contains("20000:30000"))
+        assertTrue(hy2AdvConfig.contains("\"password\": \"my secret\""))
+        assertTrue(hy2AdvConfig.contains("\"type\": \"salamander\""))
+        assertTrue(hy2AdvConfig.contains("\"password\": \"salapass\""))
+        assertTrue(hy2AdvConfig.contains("\"up_mbps\": 50"))
+        assertTrue(hy2AdvConfig.contains("\"down_mbps\": 100"))
+        assertTrue(hy2AdvConfig.contains("\"insecure\": true"))
     }
 
     @Test

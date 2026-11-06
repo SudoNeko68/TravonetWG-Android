@@ -301,10 +301,9 @@ object ProxyLinkParser {
             .removePrefix("hysteria2://").removePrefix("HYSTERIA2://")
             .removePrefix("hy2://").removePrefix("HY2://")
 
-        val atIdx = withoutFrag.indexOf('@')
+        val atIdx = withoutFrag.lastIndexOf('@')
         val afterAt = if (atIdx >= 0) withoutFrag.substring(atIdx + 1) else withoutFrag
-        val qIdx = afterAt.indexOf('?')
-        val hostPort = if (qIdx >= 0) afterAt.substring(0, qIdx).trim() else afterAt.trim()
+        val hostPort = afterAt.substringBefore('?').substringBefore('/').trim()
 
         val name = when {
             fragment.isNotBlank() -> decodeFragment(fragment)

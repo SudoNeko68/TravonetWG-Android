@@ -78,16 +78,14 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    private var uiReceiver: android.content.BroadcastReceiver? = null
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
 
-        // Background warmup of native JNI library to avoid blocking UI rendering
-        Thread {
-            try {
-                Class.forName("org.travonet.backend.GoBackend")
-            } catch (_: Throwable) {}
-        }.start()
+        TunnelManager.init(this)
+        uiReceiver = TunnelManager.registerUiReceiver(this)
 
         setContent {
             TravonetWGTheme {
@@ -131,6 +129,23 @@ class MainActivity : ComponentActivity() {
             ) {
                 notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
             }
+        }
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        uiReceiver?.let {
+            try {
+                unregisterReceiver(it)
+            } catch (_: Exception) {}
+        }
+        uiReceiver = null
+    }
+
+    override fun onTrimMemory(level: Int) {
+        super.onTrimMemory(level)
+        if (level >= TRIM_MEMORY_UI_HIDDEN) {
+            System.gc()
         }
     }
 }

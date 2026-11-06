@@ -592,8 +592,11 @@ fun MainScreen(
             isWakeLock = repository.isWakeLockEnabled(),
             isAutoReconnect = repository.isAutoReconnectEnabled(),
             isShowAddresses = showAddresses,
+            currentDnsPreset = repository.getDnsPreset(),
+            currentCustomDns = repository.getCustomDns(),
+            isOverrideDns = repository.isOverrideDns(),
             onDismiss = { showSettingsDialog = false },
-            onSave = { newSocksAddr, relayMode, relayUrl, relayToken, fgService, wakeLock, autoReconnect, newShowAddresses ->
+            onSave = { newSocksAddr, relayMode, relayUrl, relayToken, fgService, wakeLock, autoReconnect, newShowAddresses, dnsPreset, customDns, overrideDns ->
                 socksAddr = newSocksAddr
                 repository.setSocksListenAddr(newSocksAddr)
                 repository.saveWarpRelaySettings(relayMode, relayUrl, relayToken)
@@ -601,6 +604,9 @@ fun MainScreen(
                 repository.setWakeLockEnabled(wakeLock)
                 repository.setAutoReconnectEnabled(autoReconnect)
                 repository.setShowAddressesEnabled(newShowAddresses)
+                repository.setDnsPreset(dnsPreset)
+                repository.setCustomDns(customDns)
+                repository.setOverrideDns(overrideDns)
                 showAddresses = newShowAddresses
                 warpRelayMode = repository.getWarpRelayMode()
                 warpRelayUrl = repository.getWarpRelayUrl()

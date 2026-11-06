@@ -37,6 +37,7 @@ class TravonetSocksService : Service() {
     private var startJob: Job? = null
     private var statsJob: Job? = null
     private var isProxyActive = false
+    private val repository by lazy { AppRepository(this) }
 
     companion object {
         const val TAG = "TravonetSocks"
@@ -48,10 +49,14 @@ class TravonetSocksService : Service() {
         private const val PROXY_SOCKS_HANDLE = 99997
     }
 
+    private var serviceReceiver: android.content.BroadcastReceiver? = null
+
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onCreate() {
         super.onCreate()
+        TunnelManager.init(this)
+        serviceReceiver = TunnelManager.registerServiceReceiver(this)
         createNotificationChannel()
     }
 
@@ -65,7 +70,6 @@ class TravonetSocksService : Service() {
         if (action == ACTION_START) {
             val profileId = intent.getStringExtra(EXTRA_PROFILE_ID)
             Log.i(TAG, "onStartCommand: ACTION_START with profileId=$profileId")
-            val repository = AppRepository(this)
             val profile = repository.getProfiles().firstOrNull { it.id == profileId }
                 ?: repository.getSelectedProfile()
 
@@ -83,6 +87,7 @@ class TravonetSocksService : Service() {
 
             val strategy = repository.getSelectedStrategy()
             startProxy(profile, strategy, listenAddr)
+            return START_REDELIVER_INTENT
         }
 
         return START_NOT_STICKY
@@ -171,12 +176,14 @@ class TravonetSocksService : Service() {
                         return@launch
                     }
 
+                    val dohUrl = repository.getEffectiveDnsDohUrl()
                     val configJson = try {
                         ProxyConfigSynthesizer.synthesize(
                             profile.rawConfig,
                             targetCore,
                             mode = TunnelMode.SOCKS5,
-                            socksListen = listenAddr
+                            socksListen = listenAddr,
+                            dohUrl = dohUrl
                         )
                     } catch (e: Exception) {
                         Log.e(TAG, "Failed to synthesize proxy config for SOCKS5", e)
@@ -337,6 +344,12 @@ class TravonetSocksService : Service() {
 
     override fun onDestroy() {
         stopProxy()
+        serviceReceiver?.let {
+            try {
+                unregisterReceiver(it)
+            } catch (_: Exception) {}
+        }
+        serviceReceiver = null
         super.onDestroy()
     }
 

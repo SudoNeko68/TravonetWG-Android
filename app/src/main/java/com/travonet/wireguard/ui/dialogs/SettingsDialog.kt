@@ -56,6 +56,9 @@ fun AppSettingsDialog(
     isWakeLock: Boolean,
     isAutoReconnect: Boolean,
     isShowAddresses: Boolean,
+    currentDnsPreset: String = "cloudflare",
+    currentCustomDns: String = "1.1.1.1, 8.8.8.8",
+    isOverrideDns: Boolean = true,
     onDismiss: () -> Unit,
     onSave: (
         socksAddr: String,
@@ -65,7 +68,10 @@ fun AppSettingsDialog(
         foregroundService: Boolean,
         wakeLock: Boolean,
         autoReconnect: Boolean,
-        showAddresses: Boolean
+        showAddresses: Boolean,
+        dnsPreset: String,
+        customDns: String,
+        overrideDns: Boolean
     ) -> Unit
 ) {
     var socksAddr by remember { mutableStateOf(currentSocksAddr) }
@@ -76,6 +82,9 @@ fun AppSettingsDialog(
     var wakeLock by remember { mutableStateOf(isWakeLock) }
     var autoReconnect by remember { mutableStateOf(isAutoReconnect) }
     var showAddresses by remember { mutableStateOf(isShowAddresses) }
+    var dnsPreset by remember { mutableStateOf(currentDnsPreset) }
+    var customDns by remember { mutableStateOf(currentCustomDns) }
+    var overrideDns by remember { mutableStateOf(isOverrideDns) }
 
     val context = LocalContext.current
     val powerManager = remember { context.getSystemService(Context.POWER_SERVICE) as? PowerManager }
@@ -90,7 +99,8 @@ fun AppSettingsDialog(
     }
 
     val customRelayValid = relayMode != WarpRelayMode.CUSTOM || relayUrl.isNotBlank()
-    val canSave = socksAddr.isNotBlank() && customRelayValid
+    val customDnsValid = !overrideDns || dnsPreset != "custom" || customDns.isNotBlank()
+    val canSave = socksAddr.isNotBlank() && customRelayValid && customDnsValid
 
     AlertDialog(
         onDismissRequest = onDismiss,
@@ -198,6 +208,76 @@ fun AppSettingsDialog(
                 HorizontalDivider(Modifier.padding(vertical = 2.dp))
 
                 Text(
+                    text = "DNS серверы",
+                    style = MaterialTheme.typography.titleSmall,
+                    fontWeight = FontWeight.Bold
+                )
+
+                SettingsSwitchRow(
+                    title = "Глобальный DNS",
+                    subtitle = "Принудительно применять выбранный DNS ко всем профилям и ядрам",
+                    checked = overrideDns,
+                    onCheckedChange = { overrideDns = it }
+                )
+
+                if (overrideDns) {
+                    RelayModeRow(
+                        title = "Cloudflare (1.1.1.1)",
+                        subtitle = "1.1.1.1, 1.0.0.1 (DoH https://1.1.1.1/dns-query)",
+                        selected = dnsPreset == "cloudflare",
+                        enabled = true,
+                        onClick = { dnsPreset = "cloudflare" }
+                    )
+                    RelayModeRow(
+                        title = "Google (8.8.8.8)",
+                        subtitle = "8.8.8.8, 8.8.4.4 (DoH https://dns.google/dns-query)",
+                        selected = dnsPreset == "google",
+                        enabled = true,
+                        onClick = { dnsPreset = "google" }
+                    )
+                    RelayModeRow(
+                        title = "AdGuard DNS",
+                        subtitle = "94.140.14.14 (DoH с блокировкой рекламы и трекеров)",
+                        selected = dnsPreset == "adguard",
+                        enabled = true,
+                        onClick = { dnsPreset = "adguard" }
+                    )
+                    RelayModeRow(
+                        title = "Quad9",
+                        subtitle = "9.9.9.9 (DoH с защитой от фишинга и вредоносных сайтов)",
+                        selected = dnsPreset == "quad9",
+                        enabled = true,
+                        onClick = { dnsPreset = "quad9" }
+                    )
+                    RelayModeRow(
+                        title = "Свой DNS",
+                        subtitle = "Указать IP-адреса через запятую или DoH/DoT/UDP URL",
+                        selected = dnsPreset == "custom",
+                        enabled = true,
+                        onClick = { dnsPreset = "custom" }
+                    )
+
+                    if (dnsPreset == "custom") {
+                        OutlinedTextField(
+                            value = customDns,
+                            onValueChange = { customDns = it },
+                            label = { Text("DNS серверы") },
+                            placeholder = { Text("1.1.1.1, 8.8.8.8 или https://...") },
+                            singleLine = true,
+                            isError = customDns.isBlank(),
+                            supportingText = {
+                                if (customDns.isBlank()) {
+                                    Text("Введите хотя бы один IP-адрес или DoH URL")
+                                }
+                            },
+                            modifier = Modifier.fillMaxWidth()
+                        )
+                    }
+                }
+
+                HorizontalDivider(Modifier.padding(vertical = 2.dp))
+
+                Text(
                     text = "Релей регистрации WARP",
                     style = MaterialTheme.typography.titleSmall,
                     fontWeight = FontWeight.Bold
@@ -278,7 +358,10 @@ fun AppSettingsDialog(
                         foregroundService,
                         wakeLock,
                         autoReconnect,
-                        showAddresses
+                        showAddresses,
+                        dnsPreset,
+                        customDns.trim(),
+                        overrideDns
                     )
                 },
                 enabled = canSave

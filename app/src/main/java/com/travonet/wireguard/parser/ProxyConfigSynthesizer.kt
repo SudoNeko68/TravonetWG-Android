@@ -14,14 +14,15 @@ object ProxyConfigSynthesizer {
         rawConfig: String,
         targetCore: CoreType,
         mode: TunnelMode = TunnelMode.VPN,
-        socksListen: String = "127.0.0.1:1080"
+        socksListen: String = "127.0.0.1:1080",
+        dohUrl: String = "https://1.1.1.1/dns-query"
     ): String {
         val trimmed = rawConfig.trim()
         if (targetCore == CoreType.FREETURN) {
             return buildFreeTurn(trimmed, mode, socksListen)
         }
         if (trimmed.startsWith("{") && trimmed.endsWith("}")) {
-            return ensureInbound(trimmed, targetCore, mode, socksListen)
+            return ensureInbound(trimmed, targetCore, mode, socksListen, dohUrl)
         }
 
         val lower = trimmed.lowercase()
@@ -30,9 +31,9 @@ object ProxyConfigSynthesizer {
             lower.startsWith("vmess://") -> buildVmess(trimmed, targetCore, mode, socksListen)
             lower.startsWith("trojan://") -> buildTrojan(trimmed, targetCore, mode, socksListen)
             lower.startsWith("ss://") -> buildShadowsocks(trimmed, targetCore, mode, socksListen)
-            lower.startsWith("tuic://") -> buildTuic(trimmed, targetCore, mode, socksListen)
-            lower.startsWith("hysteria2://") || lower.startsWith("hy2://") -> buildHysteria2(trimmed, targetCore, mode, socksListen)
-            lower.startsWith("shadowtls://") -> buildShadowTls(trimmed, targetCore, mode, socksListen)
+            lower.startsWith("tuic://") -> buildTuic(trimmed, targetCore, mode, socksListen, dohUrl)
+            lower.startsWith("hysteria2://") || lower.startsWith("hy2://") -> buildHysteria2(trimmed, targetCore, mode, socksListen, dohUrl)
+            lower.startsWith("shadowtls://") -> buildShadowTls(trimmed, targetCore, mode, socksListen, dohUrl)
             else -> buildGenericProxy(trimmed, targetCore, mode, socksListen)
         }
     }
@@ -41,7 +42,8 @@ object ProxyConfigSynthesizer {
         jsonStr: String,
         targetCore: CoreType,
         mode: TunnelMode,
-        socksListen: String
+        socksListen: String,
+        dohUrl: String = ""
     ): String {
         return try {
             val root = JSONObject(jsonStr)
@@ -72,6 +74,139 @@ object ProxyConfigSynthesizer {
                 }
             }
             root.put("inbounds", newInbounds)
+
+            if (targetCore == CoreType.SINGBOX) {
+                // 1. Remove deprecated special outbounds (e.g. type: "dns")
+                val outbounds = root.optJSONArray("outbounds")
+                if (outbounds != null) {
+                    val cleanOutbounds = JSONArray()
+                    for (i in 0 until outbounds.length()) {
+                        val outObj = outbounds.optJSONObject(i) ?: continue
+                        if (outObj.optString("type").equals("dns", ignoreCase = true)) {
+                            continue
+                        }
+                        // Normalize Hysteria2 server_ports (must be JSONArray with start:end syntax)
+                        if (outObj.optString("type").equals("hysteria2", ignoreCase = true)) {
+                            val sPorts = outObj.opt("server_ports")
+                            if (sPorts is String && sPorts.isNotBlank()) {
+                                val arr = JSONArray()
+                                sPorts.split(",").map { it.trim() }.filter { it.isNotEmpty() }.forEach { p ->
+                                    val formatted = if (p.contains("-")) {
+                                        "${p.substringBefore("-").trim()}:${p.substringAfter("-").trim()}"
+                                    } else {
+                                        p
+                                    }
+                                    arr.put(formatted)
+                                }
+                                outObj.put("server_ports", arr)
+                            } else if (sPorts is JSONArray) {
+                                val arr = JSONArray()
+                                for (idx in 0 until sPorts.length()) {
+                                    val p = sPorts.optString(idx)
+                                    val formatted = if (p.contains("-")) {
+                                        "${p.substringBefore("-").trim()}:${p.substringAfter("-").trim()}"
+                                    } else {
+                                        p
+                                    }
+                                    arr.put(formatted)
+                                }
+                                outObj.put("server_ports", arr)
+                            }
+                        }
+                        cleanOutbounds.put(outObj)
+                    }
+                    root.put("outbounds", cleanOutbounds)
+                }
+
+                // 2. Migrate route.rules to modern action: "hijack-dns"
+                val routeObj = root.optJSONObject("route")
+                if (routeObj != null) {
+                    val rules = routeObj.optJSONArray("rules")
+                    if (rules != null) {
+                        var hasDnsHijack = false
+                        for (i in 0 until rules.length()) {
+                            val rule = rules.optJSONObject(i) ?: continue
+                            val outbound = rule.optString("outbound")
+                            if (outbound.equals("dns", ignoreCase = true) || outbound.equals("dns-out", ignoreCase = true)) {
+                                rule.remove("outbound")
+                                rule.put("action", "hijack-dns")
+                                hasDnsHijack = true
+                            }
+                            if (rule.optString("action").equals("hijack-dns", ignoreCase = true)) {
+                                hasDnsHijack = true
+                            }
+                        }
+                        if (!hasDnsHijack && mode == TunnelMode.VPN) {
+                            rules.put(0, JSONObject().apply {
+                                put("protocol", "dns")
+                                put("action", "hijack-dns")
+                            })
+                        }
+                    }
+                }
+
+                // 3. Migrate legacy dns.servers format to Sing-box 1.12+/1.14+
+                if (mode == TunnelMode.VPN) {
+                    val dnsObj = root.optJSONObject("dns")
+                    val effectiveDoh = dohUrl.ifBlank { "https://1.1.1.1/dns-query" }
+                    if (dnsObj != null) {
+                        val servers = dnsObj.optJSONArray("servers")
+                        if (servers != null) {
+                            val newServers = JSONArray()
+                            var hasDirect = false
+
+                            for (i in 0 until servers.length()) {
+                                val sObj = servers.optJSONObject(i) ?: continue
+                                val tag = sObj.optString("tag", "dns-$i")
+                                val detour = sObj.optString("detour", "proxy")
+                                if (sObj.has("type")) {
+                                    if (tag == "remote-dns" && dohUrl.isNotBlank()) {
+                                        newServers.put(createSingboxDnsServer(effectiveDoh, tag, detour))
+                                    } else {
+                                        if (tag == "direct-dns" || sObj.optString("type").equals("local", ignoreCase = true)) {
+                                            hasDirect = true
+                                        }
+                                        newServers.put(sObj)
+                                    }
+                                } else if (sObj.has("address")) {
+                                    val addr = sObj.optString("address")
+                                    val isLocal = addr.equals("local", ignoreCase = true)
+                                    val effectiveServerUrl = if (isLocal) "local" else effectiveDoh
+                                    if (isLocal || tag == "direct-dns") hasDirect = true
+                                    newServers.put(createSingboxDnsServer(effectiveServerUrl, tag, detour))
+                                } else {
+                                    newServers.put(sObj)
+                                }
+                            }
+                            if (!hasDirect) {
+                                newServers.put(createSingboxDnsServer("local", "direct-dns", "direct"))
+                            }
+                            dnsObj.put("servers", newServers)
+                        } else {
+                            dnsObj.put("servers", JSONArray().apply {
+                                put(createSingboxDnsServer(effectiveDoh, "remote-dns", "proxy"))
+                                put(createSingboxDnsServer("local", "direct-dns", "direct"))
+                            })
+                        }
+                    } else {
+                        root.put("dns", JSONObject().apply {
+                            put("servers", JSONArray().apply {
+                                put(createSingboxDnsServer(effectiveDoh, "remote-dns", "proxy"))
+                                put(createSingboxDnsServer("local", "direct-dns", "direct"))
+                            })
+                            put("rules", JSONArray().apply {
+                                put(JSONObject().apply {
+                                    put("outbound", JSONArray().put("any"))
+                                    put("server", "remote-dns")
+                                })
+                            })
+                            put("strategy", "prefer_ipv4")
+                            put("independent_cache", true)
+                        })
+                    }
+                }
+            }
+
             root.toString(2)
         } catch (_: Exception) {
             jsonStr
@@ -98,6 +233,8 @@ object ProxyConfigSynthesizer {
                 })
                 put("auto_route", false)
                 put("strict_route", false)
+                put("stack", "mixed")
+                put("sniff", true)
             }
         }
     }
@@ -174,7 +311,8 @@ object ProxyConfigSynthesizer {
         root: JSONObject,
         proxyOutbound: JSONObject,
         mode: TunnelMode,
-        socksListen: String = "127.0.0.1:1080"
+        socksListen: String = "127.0.0.1:1080",
+        dohUrl: String = "https://1.1.1.1/dns-query"
     ): String {
         if (!root.has("inbounds")) {
             root.put("inbounds", JSONArray().put(createSingboxInbound(mode, socksListen)))
@@ -193,27 +331,21 @@ object ProxyConfigSynthesizer {
         val inboundTag = if (mode == TunnelMode.SOCKS5) "socks-in" else "tun-in"
 
         if (mode == TunnelMode.VPN) {
-            val dnsOutbound = JSONObject().apply {
-                put("type", "dns")
-                put("tag", "dns-out")
-            }
-            outbounds.put(dnsOutbound)
-
             root.put("dns", JSONObject().apply {
                 val servers = JSONArray().apply {
-                    put(JSONObject().apply {
-                        put("tag", "remote-dns")
-                        put("address", "tcp://1.1.1.1")
-                        put("detour", "proxy")
-                    })
-                    put(JSONObject().apply {
-                        put("tag", "direct-dns")
-                        put("address", "local")
-                        put("detour", "direct")
-                    })
+                    put(createSingboxDnsServer(dohUrl, "remote-dns", "proxy"))
+                    put(createSingboxDnsServer("local", "direct-dns", "direct"))
                 }
                 put("servers", servers)
+                val dnsRules = JSONArray().apply {
+                    put(JSONObject().apply {
+                        put("outbound", JSONArray().put("any"))
+                        put("server", "direct-dns")
+                    })
+                }
+                put("rules", dnsRules)
                 put("strategy", "prefer_ipv4")
+                put("independent_cache", true)
             })
 
             root.put("route", JSONObject().apply {
@@ -224,7 +356,7 @@ object ProxyConfigSynthesizer {
                     })
                     put(JSONObject().apply {
                         put("protocol", "dns")
-                        put("outbound", "dns-out")
+                        put("action", "hijack-dns")
                     })
                     put(JSONObject().apply {
                         put("inbound", inboundTag)
@@ -255,24 +387,30 @@ object ProxyConfigSynthesizer {
 
     private fun parseUriHostPort(afterScheme: String): Triple<String, String, Int> {
         val withoutFrag = afterScheme.substringBefore("#")
-        val atIdx = withoutFrag.indexOf('@')
-        val auth = if (atIdx >= 0) withoutFrag.substring(0, atIdx).trim() else ""
+        val atIdx = withoutFrag.lastIndexOf('@')
+        val rawAuth = if (atIdx >= 0) withoutFrag.substring(0, atIdx).trim() else ""
         val remainder = if (atIdx >= 0) withoutFrag.substring(atIdx + 1) else withoutFrag
-        val queryPart = remainder.substringBefore('?')
+        val hostPart = remainder.substringBefore('?').substringBefore('/').trim()
+
+        val auth = try {
+            URLDecoder.decode(rawAuth.replace("+", "%2B"), StandardCharsets.UTF_8.name())
+        } catch (_: Exception) {
+            rawAuth
+        }
 
         val host: String
         val port: Int
-        if (queryPart.startsWith("[")) {
-            val closeBracket = queryPart.indexOf(']')
-            host = queryPart.substring(1, closeBracket)
-            val colonIdx = queryPart.indexOf(':', closeBracket)
-            port = if (colonIdx >= 0) queryPart.substring(colonIdx + 1).toIntOrNull() ?: 443 else 443
-        } else if (queryPart.contains(":")) {
-            val parts = queryPart.split(":")
-            host = parts[0].trim()
-            port = parts.getOrNull(1)?.toIntOrNull() ?: 443
+        if (hostPart.startsWith("[")) {
+            val closeBracket = hostPart.indexOf(']')
+            host = hostPart.substring(1, closeBracket)
+            val colonIdx = hostPart.indexOf(':', closeBracket)
+            port = if (colonIdx >= 0) hostPart.substring(colonIdx + 1).trim().toIntOrNull() ?: 443 else 443
+        } else if (hostPart.contains(":")) {
+            val colonIdx = hostPart.lastIndexOf(':')
+            host = hostPart.substring(0, colonIdx).trim()
+            port = hostPart.substring(colonIdx + 1).trim().toIntOrNull() ?: 443
         } else {
-            host = queryPart.trim()
+            host = hostPart.trim()
             port = 443
         }
 
@@ -697,7 +835,8 @@ object ProxyConfigSynthesizer {
         uri: String,
         targetCore: CoreType,
         mode: TunnelMode = TunnelMode.VPN,
-        socksListen: String = "127.0.0.1:1080"
+        socksListen: String = "127.0.0.1:1080",
+        dohUrl: String = "https://1.1.1.1/dns-query"
     ): String {
         val withoutScheme = uri.substring(uri.indexOf("://") + 3)
         val (auth, host, port) = parseUriHostPort(withoutScheme)
@@ -727,7 +866,7 @@ object ProxyConfigSynthesizer {
             })
         }
 
-        return completeSingboxConfig(root, tuicOutbound, mode)
+        return completeSingboxConfig(root, tuicOutbound, mode, socksListen, dohUrl)
     }
 
     // 6. Hysteria 2 (Sing-box)
@@ -735,13 +874,18 @@ object ProxyConfigSynthesizer {
         uri: String,
         targetCore: CoreType,
         mode: TunnelMode = TunnelMode.VPN,
-        socksListen: String = "127.0.0.1:1080"
+        socksListen: String = "127.0.0.1:1080",
+        dohUrl: String = "https://1.1.1.1/dns-query"
     ): String {
         val withoutScheme = uri.substring(uri.indexOf("://") + 3)
-        val (password, host, port) = parseUriHostPort(withoutScheme)
+        val (parsedPassword, host, port) = parseUriHostPort(withoutScheme)
         val params = parseQueryParams(uri)
-        val sni = params["sni"] ?: host
-        val insecure = params["insecure"] == "1" || params["allowinsecure"] == "1" || params["insecure"] == "true"
+        val password = parsedPassword.ifBlank {
+            params["auth"] ?: params["password"] ?: params["pwd"] ?: ""
+        }
+        val sni = params["sni"] ?: params["peer"] ?: host
+        val insecure = params["insecure"] == "1" || params["allowinsecure"] == "1" ||
+                params["insecure"] == "true" || params["allow_insecure"] == "1"
 
         val root = JSONObject()
         root.put("log", JSONObject().put("level", "warn"))
@@ -751,16 +895,72 @@ object ProxyConfigSynthesizer {
             put("type", "hysteria2")
             put("tag", "proxy")
             put("server", host)
-            put("server_port", port)
+
+            val mport = params["mport"] ?: params["ports"] ?: params["server_ports"]
+            if (!mport.isNullOrBlank()) {
+                val portsArray = JSONArray()
+                mport.split(",").map { it.trim() }.filter { it.isNotEmpty() }.forEach { p ->
+                    val formatted = if (p.contains("-")) {
+                        val start = p.substringBefore("-").trim()
+                        val end = p.substringAfter("-").trim()
+                        "$start:$end"
+                    } else {
+                        p
+                    }
+                    portsArray.put(formatted)
+                }
+                put("server_ports", portsArray)
+            } else {
+                put("server_port", port)
+            }
+
             put("password", password)
+
+            // Obfuscation (Salamander)
+            val obfsType = params["obfs"] ?: params["obfs-type"] ?: params["obfs_type"]
+            val obfsPassword = params["obfs-password"] ?: params["obfs_password"] ?: params["obfspassword"]
+            if (!obfsPassword.isNullOrBlank() || (!obfsType.isNullOrBlank() && obfsType != "none")) {
+                val effectiveType = if (!obfsType.isNullOrBlank() && obfsType != "none") obfsType else "salamander"
+                put("obfs", JSONObject().apply {
+                    put("type", effectiveType)
+                    if (!obfsPassword.isNullOrBlank()) {
+                        put("password", obfsPassword)
+                    }
+                })
+            }
+
+            // Bandwidth
+            val up = parseBandwidthMbps(params["up"] ?: params["upmbps"] ?: params["upload"])
+            val down = parseBandwidthMbps(params["down"] ?: params["downmbps"] ?: params["download"])
+            if (up > 0) put("up_mbps", up)
+            if (down > 0) put("down_mbps", down)
+
+            // TLS configuration
             put("tls", JSONObject().apply {
                 put("enabled", true)
                 put("server_name", sni)
                 if (insecure) put("insecure", true)
+                val alpn = params["alpn"]
+                if (!alpn.isNullOrBlank()) {
+                    val alpnArray = JSONArray()
+                    alpn.split(",").map { it.trim() }.filter { it.isNotEmpty() }.forEach { alpnArray.put(it) }
+                    put("alpn", alpnArray)
+                }
+                val pin = params["pinsha256"] ?: params["pin"] ?: params["cert_sha256"]
+                if (!pin.isNullOrBlank()) {
+                    put("pinned_peer_certificate_chain_sha256", JSONArray().put(pin))
+                }
             })
         }
 
-        return completeSingboxConfig(root, hy2Outbound, mode)
+        return completeSingboxConfig(root, hy2Outbound, mode, socksListen, dohUrl)
+    }
+
+    private fun parseBandwidthMbps(raw: String?): Int {
+        if (raw.isNullOrBlank()) return 0
+        val cleaned = raw.trim().lowercase()
+        val digits = cleaned.filter { it.isDigit() }.toIntOrNull() ?: return 0
+        return if (cleaned.contains("g")) digits * 1000 else digits
     }
 
     // 7. ShadowTLS (Sing-box)
@@ -768,7 +968,8 @@ object ProxyConfigSynthesizer {
         uri: String,
         targetCore: CoreType,
         mode: TunnelMode = TunnelMode.VPN,
-        socksListen: String = "127.0.0.1:1080"
+        socksListen: String = "127.0.0.1:1080",
+        dohUrl: String = "https://1.1.1.1/dns-query"
     ): String {
         val withoutScheme = uri.substring(uri.indexOf("://") + 3)
         val (password, host, port) = parseUriHostPort(withoutScheme)
@@ -791,7 +992,7 @@ object ProxyConfigSynthesizer {
             })
         }
 
-        return completeSingboxConfig(root, shadowTlsOutbound, mode)
+        return completeSingboxConfig(root, shadowTlsOutbound, mode, socksListen, dohUrl)
     }
 
     fun buildFreeTurn(
@@ -1004,5 +1205,85 @@ object ProxyConfigSynthesizer {
             }
         }
         return null
+    }
+
+    private fun createSingboxDnsServer(urlOrIp: String, tag: String, detour: String): JSONObject {
+        val serverObj = JSONObject().apply {
+            put("tag", tag)
+            put("detour", detour)
+        }
+        val clean = urlOrIp.trim()
+        when {
+            clean.equals("local", ignoreCase = true) -> {
+                serverObj.put("type", "local")
+            }
+            clean.startsWith("https://", ignoreCase = true) -> {
+                serverObj.put("type", "https")
+                val uri = try { java.net.URI(clean) } catch (_: Exception) { null }
+                val host = uri?.host ?: clean.removePrefix("https://").substringBefore('/').substringBefore(':')
+                val path = if (!uri?.rawPath.isNullOrEmpty()) uri?.rawPath else "/dns-query"
+                val port = uri?.port?.takeIf { it > 0 } ?: 443
+                serverObj.put("server", host)
+                if (port != 443) serverObj.put("server_port", port)
+                serverObj.put("path", path)
+                if (!isIpAddress(host)) {
+                    serverObj.put("domain_resolver", "direct-dns")
+                }
+            }
+            clean.startsWith("h3://", ignoreCase = true) -> {
+                serverObj.put("type", "h3")
+                val uri = try { java.net.URI(clean) } catch (_: Exception) { null }
+                val host = uri?.host ?: clean.removePrefix("h3://").substringBefore('/').substringBefore(':')
+                val path = if (!uri?.rawPath.isNullOrEmpty()) uri?.rawPath else "/dns-query"
+                val port = uri?.port?.takeIf { it > 0 } ?: 443
+                serverObj.put("server", host)
+                if (port != 443) serverObj.put("server_port", port)
+                serverObj.put("path", path)
+                if (!isIpAddress(host)) {
+                    serverObj.put("domain_resolver", "direct-dns")
+                }
+            }
+            clean.startsWith("tls://", ignoreCase = true) -> {
+                serverObj.put("type", "tls")
+                val hostPort = clean.removePrefix("tls://").substringBefore('/')
+                val host = hostPort.substringBefore(':')
+                val port = hostPort.substringAfter(':', "853").toIntOrNull() ?: 853
+                serverObj.put("server", host)
+                serverObj.put("server_port", port)
+                if (!isIpAddress(host)) {
+                    serverObj.put("domain_resolver", "direct-dns")
+                }
+            }
+            clean.startsWith("tcp://", ignoreCase = true) -> {
+                serverObj.put("type", "tcp")
+                val hostPort = clean.removePrefix("tcp://").substringBefore('/')
+                val host = hostPort.substringBefore(':')
+                val port = hostPort.substringAfter(':', "53").toIntOrNull() ?: 53
+                serverObj.put("server", host)
+                serverObj.put("server_port", port)
+                if (!isIpAddress(host)) {
+                    serverObj.put("domain_resolver", "direct-dns")
+                }
+            }
+            else -> {
+                serverObj.put("type", "udp")
+                val raw = clean.removePrefix("udp://").substringBefore('/')
+                val host = raw.substringBefore(':')
+                val port = raw.substringAfter(':', "53").toIntOrNull() ?: 53
+                serverObj.put("server", host)
+                serverObj.put("server_port", port)
+                if (!isIpAddress(host)) {
+                    serverObj.put("domain_resolver", "direct-dns")
+                }
+            }
+        }
+        return serverObj
+    }
+
+    private fun isIpAddress(host: String): Boolean {
+        val parts = host.split(".")
+        if (parts.size == 4 && parts.all { it.toIntOrNull() in 0..255 }) return true
+        if (host.contains(":") && host.split(":").size >= 3) return true
+        return false
     }
 }

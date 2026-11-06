@@ -41,8 +41,8 @@ object CoreRouter {
             trimmed.startsWith("{") && trimmed.endsWith("}") -> {
                 when {
                     isFreeTurnJson(trimmed) -> SupportedProtocol.FREETURN
-                    isSingBoxJson(trimmed) -> SupportedProtocol.TUIC
-                    else -> SupportedProtocol.VLESS
+                    isSingBoxJson(trimmed) -> detectSingBoxProtocol(trimmed)
+                    else -> detectXrayProtocol(trimmed)
                 }
             }
 
@@ -142,9 +142,64 @@ object CoreRouter {
     }
 
     private fun isSingBoxJson(json: String): Boolean {
-        return (json.contains("\"inbounds\"") && json.contains("\"outbounds\"") && json.contains("\"route\"")) ||
-                json.contains("\"experimental\"") ||
-                json.contains("\"clash_api\"")
+        val lower = json.lowercase()
+        return (lower.contains("\"inbounds\"") && lower.contains("\"outbounds\"")) ||
+                lower.contains("\"experimental\"") ||
+                lower.contains("\"clash_api\"") ||
+                lower.contains("\"hysteria2\"") ||
+                lower.contains("\"hysteria\"") ||
+                lower.contains("\"tuic\"") ||
+                lower.contains("\"shadowtls\"")
+    }
+
+    private fun detectSingBoxProtocol(json: String): SupportedProtocol {
+        try {
+            val root = org.json.JSONObject(json)
+            val outbounds = root.optJSONArray("outbounds")
+            if (outbounds != null) {
+                for (i in 0 until outbounds.length()) {
+                    val ob = outbounds.optJSONObject(i) ?: continue
+                    val type = ob.optString("type", "").lowercase()
+                    when (type) {
+                        "hysteria2", "hysteria", "hy2" -> return SupportedProtocol.HYSTERIA2
+                        "tuic" -> return SupportedProtocol.TUIC
+                        "shadowtls" -> return SupportedProtocol.SHADOWTLS
+                        "vless" -> return SupportedProtocol.VLESS
+                        "vmess" -> return SupportedProtocol.VMESS
+                        "trojan" -> return SupportedProtocol.TROJAN
+                        "shadowsocks", "ss" -> return SupportedProtocol.SHADOWSOCKS
+                        "wireguard", "wg" -> return SupportedProtocol.WIREGUARD
+                    }
+                }
+            }
+        } catch (_: Exception) {}
+
+        val lower = json.lowercase()
+        return when {
+            lower.contains("\"type\":\"hysteria2\"") || lower.contains("\"type\": \"hysteria2\"") ||
+            lower.contains("\"type\":\"hysteria\"") || lower.contains("\"type\": \"hysteria\"") ||
+            lower.contains("\"type\":\"hy2\"") || lower.contains("\"type\": \"hy2\"") -> SupportedProtocol.HYSTERIA2
+
+            lower.contains("\"type\":\"tuic\"") || lower.contains("\"type\": \"tuic\"") -> SupportedProtocol.TUIC
+            lower.contains("\"type\":\"shadowtls\"") || lower.contains("\"type\": \"shadowtls\"") -> SupportedProtocol.SHADOWTLS
+            lower.contains("\"type\":\"vless\"") || lower.contains("\"type\": \"vless\"") -> SupportedProtocol.VLESS
+            lower.contains("\"type\":\"vmess\"") || lower.contains("\"type\": \"vmess\"") -> SupportedProtocol.VMESS
+            lower.contains("\"type\":\"trojan\"") || lower.contains("\"type\": \"trojan\"") -> SupportedProtocol.TROJAN
+            lower.contains("\"type\":\"shadowsocks\"") || lower.contains("\"type\": \"shadowsocks\"") -> SupportedProtocol.SHADOWSOCKS
+            lower.contains("\"type\":\"wireguard\"") || lower.contains("\"type\": \"wireguard\"") -> SupportedProtocol.WIREGUARD
+            else -> SupportedProtocol.HYSTERIA2
+        }
+    }
+
+    private fun detectXrayProtocol(json: String): SupportedProtocol {
+        val lower = json.lowercase()
+        return when {
+            lower.contains("\"vless\"") -> SupportedProtocol.VLESS
+            lower.contains("\"vmess\"") -> SupportedProtocol.VMESS
+            lower.contains("\"trojan\"") -> SupportedProtocol.TROJAN
+            lower.contains("\"shadowsocks\"") -> SupportedProtocol.SHADOWSOCKS
+            else -> SupportedProtocol.VLESS
+        }
     }
 
     private fun isFreeTurnCli(cliText: String): Boolean {

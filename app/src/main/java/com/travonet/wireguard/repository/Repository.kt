@@ -301,7 +301,7 @@ class AppRepository(context: Context) {
     }
 
     fun isWakeLockEnabled(): Boolean {
-        return prefs.getBoolean("wakelock_enabled", false)
+        return prefs.getBoolean("wakelock_enabled", true)
     }
 
     fun setWakeLockEnabled(enabled: Boolean) {
@@ -322,6 +322,70 @@ class AppRepository(context: Context) {
 
     fun setShowAddressesEnabled(enabled: Boolean) {
         prefs.edit().putBoolean("show_addresses_enabled", enabled).apply()
+    }
+
+    // Global DNS Settings
+    fun getDnsPreset(): String {
+        return prefs.getString("dns_preset", "cloudflare") ?: "cloudflare"
+    }
+
+    fun setDnsPreset(preset: String) {
+        prefs.edit().putString("dns_preset", preset).apply()
+    }
+
+    fun getCustomDns(): String {
+        return prefs.getString("custom_dns", "1.1.1.1, 8.8.8.8") ?: "1.1.1.1, 8.8.8.8"
+    }
+
+    fun setCustomDns(customDns: String) {
+        prefs.edit().putString("custom_dns", customDns.trim()).apply()
+    }
+
+    fun isOverrideDns(): Boolean {
+        return prefs.getBoolean("override_dns_enabled", false)
+    }
+
+    fun setOverrideDns(enabled: Boolean) {
+        prefs.edit().putBoolean("override_dns_enabled", enabled).apply()
+    }
+
+    fun getEffectiveDnsServers(): List<String> {
+        return when (getDnsPreset().lowercase()) {
+            "cloudflare" -> listOf("1.1.1.1", "1.0.0.1")
+            "google" -> listOf("8.8.8.8", "8.8.4.4")
+            "adguard" -> listOf("94.140.14.14", "94.140.15.15")
+            "quad9" -> listOf("9.9.9.9", "149.112.112.112")
+            "custom" -> {
+                val raw = getCustomDns()
+                val list = raw.split(",", " ", ";")
+                    .map { it.trim() }
+                    .filter { it.isNotEmpty() && !it.startsWith("http", ignoreCase = true) }
+                if (list.isNotEmpty()) list else listOf("1.1.1.1", "8.8.8.8")
+            }
+            "system" -> emptyList()
+            else -> listOf("1.1.1.1", "1.0.0.1")
+        }
+    }
+
+    fun getEffectiveDnsDohUrl(): String {
+        return when (getDnsPreset().lowercase()) {
+            "cloudflare" -> "https://1.1.1.1/dns-query"
+            "google" -> "https://dns.google/dns-query"
+            "adguard" -> "https://dns.adguard-dns.com/dns-query"
+            "quad9" -> "https://dns.quad9.net/dns-query"
+            "custom" -> {
+                val raw = getCustomDns().trim()
+                if (raw.startsWith("https://", ignoreCase = true) || raw.startsWith("tcp://", ignoreCase = true) ||
+                    raw.startsWith("tls://", ignoreCase = true) || raw.startsWith("udp://", ignoreCase = true)) {
+                    raw
+                } else {
+                    val firstIp = raw.split(",", " ", ";").firstOrNull { it.isNotBlank() } ?: "1.1.1.1"
+                    "udp://$firstIp"
+                }
+            }
+            "system" -> "local"
+            else -> "https://1.1.1.1/dns-query"
+        }
     }
 
     // Subscription Settings (Multi-subscription support & legacy compatibility)
