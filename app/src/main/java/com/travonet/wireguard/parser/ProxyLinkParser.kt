@@ -356,16 +356,15 @@ object ProxyLinkParser {
     // 8. FreeTURN: freeturn://<base64url(json)> or CLI flags
     fun extractEmbeddedWgConfig(rawConfig: String): String? {
         val trimmed = rawConfig.trim()
-        if (trimmed.contains("[Interface]", ignoreCase = true) && trimmed.contains("[Peer]", ignoreCase = true)) {
-            return trimmed
-        }
         if (trimmed.startsWith("freeturn://", ignoreCase = true)) {
             val b64 = trimmed.removePrefix("freeturn://").removePrefix("FREETURN://").substringBefore(" ").trim()
             val decoded = tryDecodeBase64(b64)
             if (decoded != null && decoded.startsWith("{")) {
                 try {
                     val obj = JSONObject(decoded)
-                    val wg = obj.optString("wg", "")
+                    val wg = obj.optString("wg", "").ifBlank {
+                        obj.optJSONObject("tunnel")?.optString("config", "") ?: ""
+                    }
                     if (wg.isNotBlank()) return wg
                 } catch (_: Exception) {}
             }
@@ -373,12 +372,14 @@ object ProxyLinkParser {
         if (trimmed.startsWith("{") && trimmed.endsWith("}")) {
             try {
                 val obj = JSONObject(trimmed)
-                val wg = obj.optString("wg", "")
+                val wg = obj.optString("wg", "").ifBlank {
+                    obj.optJSONObject("tunnel")?.optString("config", "") ?: ""
+                }
                 if (wg.isNotBlank()) return wg
-                val tunnel = obj.optJSONObject("tunnel")
-                val tConfig = tunnel?.optString("config", "")
-                if (!tConfig.isNullOrBlank()) return tConfig
             } catch (_: Exception) {}
+        }
+        if (trimmed.contains("[Interface]", ignoreCase = true) && trimmed.contains("[Peer]", ignoreCase = true)) {
+            return trimmed
         }
         return null
     }

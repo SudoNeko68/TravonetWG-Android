@@ -1206,6 +1206,57 @@ class TravonetUnitTest {
         }
         assertTrue("direct DNS should contain Yandex fallback for RU resilience", hasYandexFallback)
     }
+
+    @Test
+    fun testFreeTurnWireguardSynthesisAndExtraction() {
+        val sampleWg = """
+            [Interface]
+            PrivateKey = aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa=
+            Address = 10.8.0.2/32
+            DNS = 1.1.1.1
+            MTU = 1360
+
+            [Peer]
+            PublicKey = bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb=
+            AllowedIPs = 0.0.0.0/0
+            Endpoint = 127.0.0.1:9000
+        """.trimIndent()
+
+        val freeTurnJsonInput = org.json.JSONObject().apply {
+            put("peer", "5.231.117.26:5000")
+            put("provider", "vk")
+            put("vk", org.json.JSONObject().apply {
+                put("links", org.json.JSONArray().put("https://vk.ru/call/join/test12345"))
+            })
+            put("wg", sampleWg)
+        }.toString()
+
+        val synthesized = com.travonet.wireguard.parser.ProxyConfigSynthesizer.synthesize(
+            rawConfig = freeTurnJsonInput,
+            targetCore = com.travonet.wireguard.core.CoreType.FREETURN,
+            mode = com.travonet.wireguard.model.TunnelMode.VPN
+        )
+
+        val root = org.json.JSONObject(synthesized)
+        assertEquals("5.231.117.26:5000", root.getString("peer"))
+        assertEquals("vk", root.getString("provider"))
+
+        // Check tunnel section
+        val tunnelObj = root.getJSONObject("tunnel")
+        assertEquals("wg", tunnelObj.getString("mode"))
+        assertTrue("tunnel.config should contain [Interface]", tunnelObj.getString("config").contains("[Interface]"))
+        assertTrue("tunnel.config should contain PrivateKey", tunnelObj.getString("config").contains("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa="))
+
+        // Verify extraction
+        val extracted = com.travonet.wireguard.parser.ProxyLinkParser.extractEmbeddedWgConfig(synthesized)
+        assertNotNull(extracted)
+        assertTrue(extracted!!.contains("10.8.0.2/32"))
+
+        // Verify parsing for Android VpnService.Builder
+        val parsedWg = com.travonet.wireguard.parser.WgConfigParser.parse(extracted)
+        assertEquals("10.8.0.2/32", parsedWg.iface.addresses.first())
+        assertEquals("0.0.0.0/0", parsedWg.peers.first().allowedIps.first())
+    }
 }
 
 
