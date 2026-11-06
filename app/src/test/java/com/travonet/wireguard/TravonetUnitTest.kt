@@ -1257,6 +1257,35 @@ class TravonetUnitTest {
         assertEquals("10.8.0.2/32", parsedWg.iface.addresses.first())
         assertEquals("0.0.0.0/0", parsedWg.peers.first().allowedIps.first())
     }
+
+    @Test
+    fun testVlessNotDetectedAsHysteria2AndNoLoglevelInSingbox() {
+        val vlessUrl = "vless://b831381d-6324-4d53-ad4f-8cda48b30811@www.blazebit.dev:443?encryption=none&security=reality&type=tcp&sni=www.blazebit.dev&fp=chrome&pbk=12345&sid=abcd&flow=xtls-rprx-vision#Польша"
+        val profile = com.travonet.wireguard.parser.ProxyLinkParser.parse(vlessUrl)
+        assertNotNull(profile)
+        assertEquals("Польша", profile?.name)
+
+        // 1. CoreRouter must identify rawConfig as VLESS and route to Xray (default)
+        val routeResult = com.travonet.wireguard.core.CoreRouter.route(profile!!.rawConfig)
+        assertEquals("VLESS (Reality)", routeResult.detectedProtocol)
+        assertEquals(com.travonet.wireguard.core.CoreType.XRAY, routeResult.targetCore)
+
+        // 2. Even if delegated to Sing-box or synthesized for Sing-box, loglevel must NOT appear
+        val singboxConf = com.travonet.wireguard.parser.ProxyConfigSynthesizer.synthesize(
+            rawConfig = profile.rawConfig,
+            targetCore = com.travonet.wireguard.core.CoreType.SINGBOX
+        )
+        val sbJson = org.json.JSONObject(singboxConf)
+        val logObj = sbJson.optJSONObject("log")
+        if (logObj != null) {
+            assertFalse("Sing-box must not contain loglevel field", logObj.has("loglevel"))
+            assertTrue("Sing-box must contain level field", logObj.has("level"))
+        }
+
+        // 3. Routing singboxConf itself must detect VLESS, NOT Hysteria 2
+        val sbRoute = com.travonet.wireguard.core.CoreRouter.route(singboxConf)
+        assertEquals("VLESS (Reality)", sbRoute.detectedProtocol)
+    }
 }
 
 

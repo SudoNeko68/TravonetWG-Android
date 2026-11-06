@@ -87,12 +87,22 @@ object ProxyConfigSynthesizer {
             root.put("inbounds", newInbounds)
 
             if (targetCore == CoreType.SINGBOX) {
+                // Fix log configuration: Sing-box rejects "loglevel" and requires "level"
+                val logObj = root.optJSONObject("log")
+                if (logObj != null && logObj.has("loglevel")) {
+                    val lvl = logObj.remove("loglevel")
+                    logObj.put("level", lvl)
+                }
+
                 // 1. Remove deprecated special outbounds (e.g. type: "dns")
                 val outbounds = root.optJSONArray("outbounds")
                 if (outbounds != null) {
                     val cleanOutbounds = JSONArray()
                     for (i in 0 until outbounds.length()) {
                         val outObj = outbounds.optJSONObject(i) ?: continue
+                        if (!outObj.has("type") && outObj.has("protocol")) {
+                            outObj.put("type", outObj.optString("protocol"))
+                        }
                         val outType = outObj.optString("type").lowercase()
                         if (outType == "dns") {
                             continue
@@ -195,6 +205,20 @@ object ProxyConfigSynthesizer {
                 // 5. Apply custom hosts rules
                 applyCustomHostsToSingbox(root, customHosts)
             } else if (targetCore == CoreType.XRAY) {
+                val logObj = root.optJSONObject("log")
+                if (logObj != null && logObj.has("level") && !logObj.has("loglevel")) {
+                    val lvl = logObj.remove("level")
+                    logObj.put("loglevel", lvl)
+                }
+                val outbounds = root.optJSONArray("outbounds")
+                if (outbounds != null) {
+                    for (i in 0 until outbounds.length()) {
+                        val outObj = outbounds.optJSONObject(i) ?: continue
+                        if (!outObj.has("protocol") && outObj.has("type")) {
+                            outObj.put("protocol", outObj.optString("type"))
+                        }
+                    }
+                }
                 applyCustomHostsToXray(root, customHosts)
             }
 
