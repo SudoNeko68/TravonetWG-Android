@@ -135,6 +135,7 @@ class TravonetVpnService : VpnService() {
             // Release only our own previous tunnel. A newer service instance
             // may already own TunnelManager.vpnHandle.
             releaseTunnelLocked()
+            delay(150)
 
             val routing = com.travonet.wireguard.core.CoreRouter.route(
                 profile.rawConfig,
@@ -270,6 +271,7 @@ class TravonetVpnService : VpnService() {
             }
             activePfd = currentPfd
             val tunFd = currentPfd.detachFd()
+            activeTunFd = tunFd
 
             registerNetworkCallback()
 
@@ -537,7 +539,8 @@ class TravonetVpnService : VpnService() {
         }
 
         val wgConfigRaw = com.travonet.wireguard.parser.ProxyLinkParser.extractEmbeddedWgConfig(profile.rawConfig)
-        val needsTun = com.freevpn.coreloader.NativeCoreBridge.checkNeedsTunNative(corePath, configStr) || (wgConfigRaw != null)
+        // In VPN mode, FreeTURN must always receive a valid TUN descriptor so that system traffic is routed into it
+        val needsTun = true
 
         var tunFd = -1
         if (needsTun) {
@@ -548,7 +551,7 @@ class TravonetVpnService : VpnService() {
                 null
             }
 
-            val mtu = if (parsed != null && parsed.iface.mtu in 1120..1420) parsed.iface.mtu else 1280
+            val mtu = if (parsed != null && parsed.iface.mtu in 1120..1420) parsed.iface.mtu else 1420
             val builder = Builder()
                 .setSession("TravonetVPN - ${profile.name} (FreeTURN)")
                 .setMtu(mtu)
@@ -573,7 +576,8 @@ class TravonetVpnService : VpnService() {
                 }
             }
             if (!hasIpv4 && !hasIpv6) {
-                builder.addAddress("10.13.13.3", 32)
+                builder.addAddress("172.19.0.1", 30)
+                hasIpv4 = true
             }
 
             var routeCount = 0

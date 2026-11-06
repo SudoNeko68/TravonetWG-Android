@@ -90,6 +90,7 @@ class MainActivity : ComponentActivity() {
 
         TunnelManager.init(this)
         uiReceiver = TunnelManager.registerUiReceiver(this)
+        checkBatteryOptimizationOnce()
 
         setContent {
             TravonetWGTheme {
@@ -99,7 +100,6 @@ class MainActivity : ComponentActivity() {
                         // actually starts a foreground tunnel, not on every
                         // cold app start.
                         checkNotificationPermission()
-                        checkBatteryOptimization()
                         withLocalNetworkPermission {
                             when (mode) {
                                 TunnelMode.VPN -> {
@@ -137,11 +137,15 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun checkBatteryOptimization() {
+    private fun checkBatteryOptimizationOnce() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            val prefs = getSharedPreferences("travonet_prefs", Context.MODE_PRIVATE)
+            if (prefs.getBoolean("battery_optimization_prompted", false)) return
+
             val pm = getSystemService(Context.POWER_SERVICE) as? PowerManager
             if (pm != null && !pm.isIgnoringBatteryOptimizations(packageName)) {
                 try {
+                    prefs.edit().putBoolean("battery_optimization_prompted", true).apply()
                     val intent = Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS).apply {
                         data = Uri.parse("package:$packageName")
                     }

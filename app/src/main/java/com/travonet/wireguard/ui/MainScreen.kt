@@ -49,6 +49,8 @@ import com.travonet.wireguard.ui.screens.CoresScreen
 import com.travonet.wireguard.ui.screens.StrategiesScreen
 import com.travonet.wireguard.warp.WarpGenerator
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.travonet.backend.GoBackend
@@ -303,33 +305,23 @@ fun MainScreen(
         if (isTestingAll || targetProfiles.isEmpty()) return
         isTestingAll = true
         scope.launch {
-            for (profile in targetProfiles) {
-                pingResults = pingResults + (profile.id to PingResult(isTesting = true))
-                val udpPing = PingHelper.pingUdpHost(profile.endpoint)
-                if (udpPing != null) {
-                    val strategy = if (profile.hasEmbeddedStrategy) {
-                        val embedded = profile.embeddedStrategy ?: activeFallbackStrategy.name
-                        strategies.firstOrNull { it.name.equals(embedded, ignoreCase = true) } ?: activeFallbackStrategy
-                    } else {
-                        activeFallbackStrategy
+            targetProfiles.chunked(6).forEach { chunk ->
+                val jobs = chunk.map { profile ->
+                    async {
+                        pingResults = pingResults + (profile.id to PingResult(isTesting = true))
+                        val tcpPing = PingHelper.pingTcpHost(profile.endpoint, timeoutMs = 1500)
+                        val udpPing = if (tcpPing == null) PingHelper.pingUdpHost(profile.endpoint, timeoutSec = 1) else null
+                        val latency = tcpPing ?: udpPing
+                        pingResults = pingResults + (profile.id to PingResult(
+                            udpPingMs = udpPing,
+                            udpError = latency == null,
+                            httpPingMs = tcpPing,
+                            httpError = tcpPing == null,
+                            isTesting = false
+                        ))
                     }
-                    val httpPing = PingHelper.pingHttp204(profile, strategy)
-                    pingResults = pingResults + (profile.id to PingResult(
-                        udpPingMs = udpPing,
-                        udpError = false,
-                        httpPingMs = httpPing,
-                        httpError = httpPing == null,
-                        isTesting = false
-                    ))
-                } else {
-                    pingResults = pingResults + (profile.id to PingResult(
-                        udpPingMs = null,
-                        udpError = true,
-                        httpPingMs = null,
-                        httpError = true,
-                        isTesting = false
-                    ))
                 }
+                jobs.awaitAll()
             }
             isTestingAll = false
         }
@@ -348,19 +340,22 @@ fun MainScreen(
         if (isPingingBottom) return
         isPingingBottom = true
         scope.launch {
-            val strategy = if (activeProf.hasEmbeddedStrategy) {
-                val embedded = activeProf.embeddedStrategy ?: activeFallbackStrategy.name
-                strategies.firstOrNull { it.name.equals(embedded, ignoreCase = true) } ?: activeFallbackStrategy
+            val curState = TunnelManager.state.value
+            val isConnected = curState.status == com.travonet.wireguard.model.TunnelStatus.CONNECTED
+            val latency = if (isConnected) {
+                PingHelper.pingConnectedTunnel(curState.mode)
             } else {
-                activeFallbackStrategy
+                PingHelper.pingTcpHost(activeProf.endpoint, timeoutMs = 1500)
+                    ?: PingHelper.pingUdpHost(activeProf.endpoint, timeoutSec = 2)
             }
-            val latency = PingHelper.pingHttp204(activeProf, strategy)
             bottomPingLatency = latency
             isPingingBottom = false
             if (latency != null) {
-                Toast.makeText(context, "Ping: $latency мс (Google 204)", Toast.LENGTH_SHORT).show()
+                val label = if (isConnected) "Ping туннеля: $latency мс" else "Ping сервера: $latency мс"
+                Toast.makeText(context, label, Toast.LENGTH_SHORT).show()
             } else {
-                Toast.makeText(context, "Ошибка пинга (Google 204 недоступен)", Toast.LENGTH_SHORT).show()
+                val label = if (isConnected) "Туннель не отвечает (Google 204)" else "Сервер недоступен"
+                Toast.makeText(context, label, Toast.LENGTH_SHORT).show()
             }
         }
     }
