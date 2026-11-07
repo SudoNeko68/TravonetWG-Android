@@ -520,8 +520,8 @@ class TravonetVpnService : VpnService() {
                 // OR
                 // 3. Absolute freeze: handshake stale > 180s regardless of tx/rx
                 val isRekeyFailed = timeSinceHandshake > 135L && deltaRx <= 0L
-                val isDeadDownlink = (deltaTx > 0L || txSentDuringStale > 200L) && deltaRx <= 0L && timeSinceHandshake > 25L
-                val isHandshakeExpired = timeSinceHandshake > 180L
+                val isDeadDownlink = (deltaTx > 0L || txSentDuringStale > 200L) && deltaRx <= 0L && timeSinceHandshake > 20L
+                val isHandshakeExpired = timeSinceHandshake > 145L
 
                 if (isRekeyFailed || isDeadDownlink || isHandshakeExpired) {
                     staleTicks++

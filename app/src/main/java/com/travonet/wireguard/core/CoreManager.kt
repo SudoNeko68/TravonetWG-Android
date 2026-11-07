@@ -239,7 +239,7 @@ class CoreManager(private val context: Context) {
 
     companion object {
         const val REPO_BASE_URL = "https://repo.travonet.ru/cores"
-        const val BUILTIN_TRAVONET_VERSION = "1.3"
+        const val BUILTIN_TRAVONET_VERSION = "1.3.1"
         const val BUILTIN_XRAY_VERSION = "1.8.24"
         const val BUILTIN_SINGBOX_VERSION = "1.10.7"
         const val BUILTIN_FREETURN_VERSION = "1.0.0"

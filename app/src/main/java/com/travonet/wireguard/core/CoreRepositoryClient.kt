@@ -230,8 +230,18 @@ object CoreRepositoryClient {
                     id = "travonet_wg",
                     name = "TravonetWG",
                     binaryName = "libtravonet-wg.so",
-                    latestVersion = "1.3",
+                    latestVersion = "1.3.1",
                     versions = listOf(
+                        RemoteCoreVersion(
+                            version = "1.3.1",
+                            date = "2026-11-07",
+                            abis = mapOf(
+                                "arm64-v8a" to RemoteCoreAbi("$base/travonet_wg/1.3.1/arm64-v8a/libtravonet-wg.so"),
+                                "armeabi-v7a" to RemoteCoreAbi("$base/travonet_wg/1.3.1/armeabi-v7a/libtravonet-wg.so"),
+                                "x86_64" to RemoteCoreAbi("$base/travonet_wg/1.3.1/x86_64/libtravonet-wg.so"),
+                                "x86" to RemoteCoreAbi("$base/travonet_wg/1.3.1/x86/libtravonet-wg.so")
+                            )
+                        ),
                         RemoteCoreVersion(
                             version = "1.3",
                             date = "2026-11-07",
