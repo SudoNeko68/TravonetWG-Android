@@ -150,8 +150,11 @@ object WgConfigParser {
         var effectiveName = name
         var effectiveConfig = rawConfig.trim()
 
-        // 1. Support wireguard:// and wg:// URL schemes (standard X-UI / 3X-UI / Sing-box / Happ WireGuard links)
-        if (effectiveConfig.startsWith("wireguard://", ignoreCase = true) || effectiveConfig.startsWith("wg://", ignoreCase = true)) {
+        // 1. Support wireguard://, wg:// and awg:// URL schemes (standard X-UI / 3X-UI / Sing-box / Happ WireGuard links)
+        if (effectiveConfig.startsWith("wireguard://", ignoreCase = true) ||
+            effectiveConfig.startsWith("wg://", ignoreCase = true) ||
+            effectiveConfig.startsWith("awg://", ignoreCase = true)
+        ) {
             val wgParsed = parseWireGuardUrl(effectiveConfig)
             if (wgParsed != null) {
                 effectiveConfig = wgParsed.first
@@ -228,15 +231,21 @@ object WgConfigParser {
     }
 
     /**
-     * Parses wireguard:// and wg:// URL schemes into standard WireGuard INI config and profile name.
+     * Parses wireguard://, wg:// and awg:// URL schemes into standard WireGuard INI config and profile name.
      * Supports both URI format (wireguard://privkey@host:port?...) and Base64 format (wireguard://base64#name).
      */
     fun parseWireGuardUrl(urlStr: String): Pair<String, String>? {
         val trimmed = urlStr.trim()
-        val isWg = trimmed.startsWith("wireguard://", ignoreCase = true) || trimmed.startsWith("wg://", ignoreCase = true)
+        val isWg = trimmed.startsWith("wireguard://", ignoreCase = true) ||
+                trimmed.startsWith("wg://", ignoreCase = true) ||
+                trimmed.startsWith("awg://", ignoreCase = true)
         if (!isWg) return null
 
-        val prefixLen = if (trimmed.startsWith("wireguard://", ignoreCase = true)) 12 else 5
+        val prefixLen = when {
+            trimmed.startsWith("wireguard://", ignoreCase = true) -> 12
+            trimmed.startsWith("awg://", ignoreCase = true) -> 6
+            else -> 5
+        }
         val afterScheme = trimmed.substring(prefixLen).trim()
         val fragment = if (afterScheme.contains("#")) afterScheme.substringAfter("#").trim() else ""
         val withoutFragment = afterScheme.substringBefore("#").trim()
@@ -308,12 +317,22 @@ object WgConfigParser {
             sb.appendLine("PersistentKeepalive = $keepalive")
             if (!psk.isNullOrBlank()) sb.appendLine("PresharedKey = $psk")
 
+            for (k in AMNEZIA_KEYS) {
+                val v = queryMap[k]
+                if (!v.isNullOrBlank()) {
+                    sb.appendLine("${k.replaceFirstChar { it.uppercase() }} = $v")
+                }
+            }
+
+            val isAwg = trimmed.startsWith("awg://", ignoreCase = true) || AMNEZIA_KEYS.any { !queryMap[it].isNullOrBlank() }
+            val defaultSchemeName = if (isAwg) "AmneziaWG" else "WireGuard"
+
             val finalName = if (decodedFragmentName.isNotBlank()) {
                 decodedFragmentName
             } else if (effectiveEndpoint.isNotBlank()) {
-                "WireGuard (${effectiveEndpoint.substringBefore(':')})"
+                "$defaultSchemeName (${effectiveEndpoint.substringBefore(':')})"
             } else {
-                "WireGuard"
+                defaultSchemeName
             }
 
             return Pair(sb.toString().trimEnd() + "\n", finalName)
@@ -322,16 +341,33 @@ object WgConfigParser {
         }
     }
 
-    /** Проверяет, содержит ли конфигурация параметры протокола AmneziaWG. */
+    val AMNEZIA_KEYS = setOf(
+        "jc", "jmin", "jmax",
+        "s1", "s2", "s3", "s4",
+        "h1", "h2", "h3", "h4",
+        "i1", "i2", "i3", "i4", "i5",
+        "headerprotectionkey", "header_protection_key",
+        "contentpaddingaddition", "content_padding_addition",
+        "randomtrailers", "random_trailers",
+        "disablecookies", "disable_cookies",
+        "rekeyaftertime", "rekey_after_time",
+        "rekeytimeout", "rekey_timeout",
+        "rejectaftertime", "reject_after_time",
+        "keepalivetimeout", "keepalive_timeout",
+        "maxhandshakeattempts", "max_handshake_attempts"
+    )
+
+    /** Проверяет, содержит ли конфигурация параметры протокола AmneziaWG (включая v3.1). */
     fun isAmneziaConfig(rawConfig: String): Boolean {
-        val lower = rawConfig.lowercase()
-        return lower.contains("jc =") || lower.contains("jc=") ||
-                lower.contains("h1 =") || lower.contains("h1=") ||
-                lower.contains("s1 =") || lower.contains("s1=") ||
-                lower.contains("headerprotectionkey") ||
-                lower.contains("header_protection_key") ||
-                lower.contains("rekeyaftertime") ||
-                lower.contains("rekey_after_time")
+        return rawConfig.lines().any { line ->
+            val trimmed = line.trim()
+            if (trimmed.isEmpty() || trimmed.startsWith("#") || trimmed.startsWith(";") || !trimmed.contains("=")) {
+                false
+            } else {
+                val key = trimmed.substringBefore("=").trim().lowercase()
+                AMNEZIA_KEYS.contains(key)
+            }
+        }
     }
 
     /**

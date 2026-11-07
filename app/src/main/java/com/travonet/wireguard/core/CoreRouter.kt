@@ -133,7 +133,21 @@ object CoreRouter {
 
     private fun isAmneziaIni(iniText: String): Boolean {
         if (!iniText.contains("[Interface]", ignoreCase = true)) return false
-        val keys = listOf("jc", "jmin", "jmax", "s1", "s2", "h1", "h2", "h3", "h4", "i1", "i2")
+        val keys = setOf(
+            "jc", "jmin", "jmax",
+            "s1", "s2", "s3", "s4",
+            "h1", "h2", "h3", "h4",
+            "i1", "i2", "i3", "i4", "i5",
+            "headerprotectionkey", "header_protection_key",
+            "contentpaddingaddition", "content_padding_addition",
+            "randomtrailers", "random_trailers",
+            "disablecookies", "disable_cookies",
+            "rekeyaftertime", "rekey_after_time",
+            "rekeytimeout", "rekey_timeout",
+            "rejectaftertime", "reject_after_time",
+            "keepalivetimeout", "keepalive_timeout",
+            "maxhandshakeattempts", "max_handshake_attempts"
+        )
         return iniText.lines().any { line ->
             val trimmed = line.trim()
             if (trimmed.startsWith("#") || trimmed.startsWith(";") || !trimmed.contains("=")) return@any false

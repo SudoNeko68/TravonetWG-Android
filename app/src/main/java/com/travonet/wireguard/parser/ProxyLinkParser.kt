@@ -23,6 +23,7 @@ object ProxyLinkParser {
                 (s.contains("-peer") && (s.contains("-link") || s.contains("-provider"))) ||
                 s.startsWith("wireguard://") ||
                 s.startsWith("wg://") ||
+                s.startsWith("awg://") ||
                 s.startsWith("vpn://")
     }
 
@@ -46,8 +47,12 @@ object ProxyLinkParser {
             s.startsWith("freeturn://") || (s.contains("-peer") && (s.contains("-link") || s.contains("-provider"))) -> {
                 parseFreeTurn(trimmed, fallbackName, subUrl, id)
             }
-            s.startsWith("wireguard://") || s.startsWith("wg://") || s.startsWith("vpn://") -> {
-                return WgConfigParser.parseProfile(fallbackName ?: "WireGuard", trimmed, id, subUrl)
+            s.startsWith("vpn://") -> {
+                return WgConfigParser.parseProfile(fallbackName ?: "AmneziaWG", trimmed, id, subUrl)
+            }
+            s.startsWith("wireguard://") || s.startsWith("wg://") || s.startsWith("awg://") -> {
+                val defaultName = if (s.startsWith("awg://")) "AmneziaWG" else "WireGuard"
+                return WgConfigParser.parseProfile(fallbackName ?: defaultName, trimmed, id, subUrl)
             }
             else -> null
         } ?: return null

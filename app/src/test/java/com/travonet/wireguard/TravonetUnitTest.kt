@@ -450,6 +450,58 @@ class TravonetUnitTest {
     }
 
     @Test
+    fun testAmneziaWg31ConfigDetected() {
+        val amnezia31Raw = """
+            [Interface]
+            PrivateKey = aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa=
+            Address = 10.8.0.2/24
+            S3 = 10
+            S4 = 15
+            I3 = <rc 8>
+            HeaderProtectionKey = 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+            ContentPaddingAddition = 16-32
+            RandomTrailers = true
+
+            [Peer]
+            PublicKey = bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb=
+            AllowedIPs = 0.0.0.0/0
+            Endpoint = 198.51.100.1:51820
+        """.trimIndent()
+
+        assertTrue(WgConfigParser.isAmneziaConfig(amnezia31Raw))
+
+        val profile = WgConfigParser.parseProfile("Amnezia 3.1 Test", amnezia31Raw)
+        val fallbackStrategy = EvasionStrategy(
+            name = "ТСПУ Burst",
+            description = "",
+            dsl = "junk(size=64) -> fake_udp(size=148)"
+        )
+
+        val prepared = WgConfigParser.prepareConfigForLaunch(profile, fallbackStrategy)
+        assertTrue("Amnezia 3.1 configs must have NoEvasion = true injected", prepared.contains("NoEvasion = true"))
+        assertFalse("Amnezia 3.1 configs must NOT have Strategy injected", prepared.contains("Strategy ="))
+        assertTrue("Amnezia S4 must be preserved", prepared.contains("S4 = 15"))
+        assertTrue("Amnezia HeaderProtectionKey must be preserved", prepared.contains("HeaderProtectionKey = 0123456789abcdef"))
+
+        val routerResult = com.travonet.wireguard.core.CoreRouter.route(amnezia31Raw)
+        assertEquals(com.travonet.wireguard.core.SupportedProtocol.AMNEZIA_WG.displayName, routerResult.detectedProtocol)
+    }
+
+    @Test
+    fun testParseAwgUrl() {
+        val awgUri = "awg://bmXOC%2BF1FxEMF9dyiK2H5%2F1SUtzH0JuVo51h2wPfgyo%3D@198.51.100.1:51820?address=10.8.0.2%2F24&privatekey=OCugIHnrk%2Fr8Zdtd5AGYIchdMag%2BdqXF08yn1AZ2aUw%3D&jc=4&jmin=50&jmax=1000&s1=20&s2=30&h1=123456#MyAwgServer"
+        val parsed = WgConfigParser.parseWireGuardUrl(awgUri)
+        assertNotNull(parsed)
+        val (config, name) = parsed!!
+        assertEquals("MyAwgServer", name)
+        assertTrue(config.contains("Jc = 4"))
+        assertTrue(config.contains("Jmin = 50"))
+        assertTrue(config.contains("S1 = 20"))
+        assertTrue(config.contains("H1 = 123456"))
+        assertTrue(WgConfigParser.isAmneziaConfig(config))
+    }
+
+    @Test
     fun testParseWireGuardUrl() {
         // 1. URL with query parameters format
         val wgUri = "wireguard://bmXOC%2BF1FxEMF9dyiK2H5%2F1SUtzH0JuVo51h2wPfgyo%3D@162.159.192.1:2408?address=172.16.0.2%2F32&privatekey=OCugIHnrk%2Fr8Zdtd5AGYIchdMag%2BdqXF08yn1AZ2aUw%3D&dns=1.1.1.1#Custom%20WireGuard"
