@@ -839,6 +839,8 @@ class TravonetVpnService : VpnService() {
             .setBlocking(false)
             .addAddress("172.19.0.1", 30)
             .addRoute("0.0.0.0", 0)
+            .addAddress("fdfe:dcba:9876::1", 126)
+            .addRoute("::", 0)
 
         builder.allowBypass()
 
@@ -861,6 +863,7 @@ class TravonetVpnService : VpnService() {
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             builder.allowFamily(android.system.OsConstants.AF_INET)
+            builder.allowFamily(android.system.OsConstants.AF_INET6)
             builder.setMetered(false)
         }
 

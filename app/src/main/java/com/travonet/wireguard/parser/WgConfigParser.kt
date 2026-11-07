@@ -310,19 +310,19 @@ object WgConfigParser {
             sb.appendLine("MTU = $mtu")
             if (!reserved.isNullOrBlank()) sb.appendLine("Reserved = $reserved")
 
-            sb.appendLine("\n[Peer]")
-            sb.appendLine("PublicKey = $publicKey")
-            if (effectiveEndpoint.isNotBlank()) sb.appendLine("Endpoint = $effectiveEndpoint")
-            sb.appendLine("AllowedIPs = $allowedIps")
-            sb.appendLine("PersistentKeepalive = $keepalive")
-            if (!psk.isNullOrBlank()) sb.appendLine("PresharedKey = $psk")
-
             for (k in AMNEZIA_KEYS) {
                 val v = queryMap[k]
                 if (!v.isNullOrBlank()) {
                     sb.appendLine("${k.replaceFirstChar { it.uppercase() }} = $v")
                 }
             }
+
+            sb.appendLine("\n[Peer]")
+            sb.appendLine("PublicKey = $publicKey")
+            if (effectiveEndpoint.isNotBlank()) sb.appendLine("Endpoint = $effectiveEndpoint")
+            sb.appendLine("AllowedIPs = $allowedIps")
+            sb.appendLine("PersistentKeepalive = $keepalive")
+            if (!psk.isNullOrBlank()) sb.appendLine("PresharedKey = $psk")
 
             val isAwg = trimmed.startsWith("awg://", ignoreCase = true) || AMNEZIA_KEYS.any { !queryMap[it].isNullOrBlank() }
             val defaultSchemeName = if (isAwg) "AmneziaWG" else "WireGuard"

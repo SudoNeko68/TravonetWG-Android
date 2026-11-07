@@ -117,7 +117,7 @@ object ProxyConfigSynthesizer {
                             if (!outObj.has("connect_timeout")) {
                                 outObj.put("connect_timeout", "10s")
                             }
-                            if (outType == "hysteria2" || outType == "tuic" || outType == "vless") {
+                            if (outType == "hysteria2" || outType == "tuic") {
                                 if (!outObj.has("keep_alive_period")) {
                                     outObj.put("keep_alive_period", "10s")
                                 }
@@ -164,16 +164,23 @@ object ProxyConfigSynthesizer {
 
                     if (mode == TunnelMode.VPN) {
                         orderedRules.put(JSONObject().apply {
+                            put("inbound", "tun-in")
                             put("port", JSONArray().put(53))
                             put("action", "hijack-dns")
                         })
                         orderedRules.put(JSONObject().apply {
+                            put("inbound", "tun-in")
                             put("protocol", "dns")
                             put("action", "hijack-dns")
                         })
                         orderedRules.put(JSONObject().apply {
                             put("port", JSONArray().put(443))
                             put("network", "udp")
+                            put("action", "reject")
+                        })
+                        orderedRules.put(JSONObject().apply {
+                            put("port", JSONArray().put(853))
+                            put("network", "tcp")
                             put("action", "reject")
                         })
                     }
@@ -341,6 +348,7 @@ object ProxyConfigSynthesizer {
                 put("tag", "tun-in")
                 put("address", JSONArray().apply {
                     put("172.19.0.1/30")
+                    put("fdfe:dcba:9876::1/126")
                 })
                 put("mtu", 1420)
                 put("auto_route", false)
@@ -512,7 +520,7 @@ object ProxyConfigSynthesizer {
             if (!proxyOutbound.has("connect_timeout")) {
                 proxyOutbound.put("connect_timeout", "10s")
             }
-            if (outType == "hysteria2" || outType == "tuic" || outType == "vless") {
+            if (outType == "hysteria2" || outType == "tuic") {
                 if (!proxyOutbound.has("keep_alive_period")) {
                     proxyOutbound.put("keep_alive_period", "10s")
                 }
@@ -531,18 +539,26 @@ object ProxyConfigSynthesizer {
         if (mode == TunnelMode.VPN) {
             root.put("route", JSONObject().apply {
                 put("auto_detect_interface", false)
+                put("final", "proxy")
                 val rules = JSONArray().apply {
                     put(JSONObject().apply {
+                        put("inbound", inboundTag)
                         put("port", JSONArray().put(53))
                         put("action", "hijack-dns")
                     })
                     put(JSONObject().apply {
+                        put("inbound", inboundTag)
                         put("protocol", "dns")
                         put("action", "hijack-dns")
                     })
                     put(JSONObject().apply {
                         put("port", JSONArray().put(443))
                         put("network", "udp")
+                        put("action", "reject")
+                    })
+                    put(JSONObject().apply {
+                        put("port", JSONArray().put(853))
+                        put("network", "tcp")
                         put("action", "reject")
                     })
                     put(JSONObject().apply {
@@ -558,6 +574,7 @@ object ProxyConfigSynthesizer {
         } else {
             root.put("route", JSONObject().apply {
                 put("auto_detect_interface", false)
+                put("final", "proxy")
                 val rules = JSONArray().apply {
                     put(JSONObject().apply {
                         put("action", "sniff")
@@ -1520,7 +1537,9 @@ object ProxyConfigSynthesizer {
     private fun createSingboxDnsServer(urlOrIp: String, tag: String, detour: String): JSONObject {
         val serverObj = JSONObject().apply {
             put("tag", tag)
-            if (detour.isNotBlank() && detour != "direct") put("detour", detour)
+            if (detour.isNotBlank() && detour != "direct") {
+                put("detour", detour)
+            }
         }
         val clean = urlOrIp.trim()
         when {
