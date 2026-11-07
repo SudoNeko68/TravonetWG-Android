@@ -43,6 +43,7 @@ class TravonetVpnService : VpnService() {
     private var startJob: Job? = null
     private var statsJob: Job? = null
     private var healthJob: Job? = null
+    private var reconnectJob: Job? = null
 
     private var connectivityManager: ConnectivityManager? = null
     private var defaultNetworkCallback: ConnectivityManager.NetworkCallback? = null
@@ -114,6 +115,8 @@ class TravonetVpnService : VpnService() {
             startForegroundServiceNotification(profile.name, "Запуск...", "Подключение...")
 
             val strategy = repository.getSelectedStrategy()
+            reconnectJob?.cancel()
+            reconnectJob = null
             startJob?.cancel()
             startJob = serviceScope.launch {
                 tunnelMutex.withLock {
@@ -383,6 +386,45 @@ class TravonetVpnService : VpnService() {
     }
 
     /**
+     * Triggers a clean auto-reconnect asynchronously without self-cancelling the calling watchdog.
+     */
+    private fun triggerReconnect(
+        profile: com.travonet.wireguard.model.WgProfile,
+        strategy: com.travonet.wireguard.model.EvasionStrategy,
+        attempt: Int,
+        message: String,
+        reason: String
+    ) {
+        if (reconnectJob?.isActive == true || destroyed) return
+        Log.w(TAG, "[AutoReconnect] $reason. Triggering reconnect (attempt $attempt)...")
+        TunnelManager.updateState(TunnelStatus.CONNECTING, message)
+
+        reconnectJob = serviceScope.launch {
+            try {
+                // Cancel existing health & stats polling immediately so they stop probing dead tunnel
+                healthJob?.cancel()
+                healthJob = null
+                statsJob?.cancel()
+                statsJob = null
+
+                tunnelMutex.withLock {
+                    releaseTunnelLocked(cancelWatchdog = false)
+                    delay(500)
+                    if (isActive && !destroyed) {
+                        startTunnelLocked(profile, strategy, attempt)
+                    }
+                }
+            } catch (e: Exception) {
+                if (e !is kotlinx.coroutines.CancellationException) {
+                    Log.e(TAG, "Error during auto-reconnect", e)
+                }
+            } finally {
+                reconnectJob = null
+            }
+        }
+    }
+
+    /**
      * Watches for the initial WireGuard handshake, or reconnects if connection is lost.
      */
     private fun startHandshakeWatchdog(
@@ -416,17 +458,13 @@ class TravonetVpnService : VpnService() {
                      TunnelManager.state.value.status == TunnelStatus.CONNECTING)
                 ) {
                     if (repository.isAutoReconnectEnabled() && attempt < 2) {
-                        Log.w(TAG, "No WireGuard handshake (attempt ${attempt + 1}/3); auto-reconnecting...")
-                        TunnelManager.updateState(TunnelStatus.CONNECTING, "Переподключение (попытка ${attempt + 2}/3)...")
-                        tunnelMutex.withLock {
-                            releaseTunnelLocked()
-                        }
-                        delay(2000)
-                        if (isActive && !destroyed) {
-                            tunnelMutex.withLock {
-                                startTunnelLocked(profile, strategy, attempt + 1)
-                            }
-                        }
+                        triggerReconnect(
+                            profile,
+                            strategy,
+                            attempt + 1,
+                            message = "Переподключение (попытка ${attempt + 2}/3)...",
+                            reason = "No initial WireGuard handshake (attempt ${attempt + 1}/3)"
+                        )
                         return@launch
                     } else {
                         Log.w(TAG, "No WireGuard handshake after attempts; tearing down")
@@ -448,13 +486,13 @@ class TravonetVpnService : VpnService() {
             if (!repository.isAutoReconnectEnabled()) return@launch
 
             // Auto-reconnect watchdog if connection drops after initial handshake
-            var staleCount = 0
+            var staleTicks = 0
+            var txSentDuringStale = 0L
             var prevTxBytes = -1L
             var prevRxBytes = -1L
-            val myUid = android.os.Process.myUid()
-            var prevUidTx = -1L
+
             while (isActive && TunnelManager.vpnHandle == handle) {
-                delay(5000)
+                delay(4000)
                 val configDump = try {
                     GoBackend.wgGetConfig(handle)
                 } catch (e: Exception) {
@@ -463,42 +501,61 @@ class TravonetVpnService : VpnService() {
                 val stats = TunnelManager.parseUapiStats(configDump)
                 val nowSec = System.currentTimeMillis() / 1000
 
-                val curUidTx = android.net.TrafficStats.getUidTxBytes(myUid).let { if (it < 0) 0L else it }
-                val hasOutgoingTraffic = (prevTxBytes >= 0L && (stats.txBytes - prevTxBytes) > 500L) ||
-                        (prevUidTx >= 0L && (curUidTx - prevUidTx) > 1024L)
-                val noIncomingTraffic = prevRxBytes >= 0L && stats.rxBytes == prevRxBytes
-                val isHandshakeStale = stats.lastHandshakeSec > 0L && (nowSec - stats.lastHandshakeSec) > 180
+                if (prevTxBytes < 0L || prevRxBytes < 0L) {
+                    prevTxBytes = stats.txBytes
+                    prevRxBytes = stats.rxBytes
+                    continue
+                }
 
-                // Соединение считается потерянным, если:
-                // 1. Handshake протух (> 180 сек) и входящий трафик остановился
-                // ИЛИ
-                // 2. Идет активная отправка пакетов (приложения шлют трафик), но ответа нет и прошло > 60 сек с handshake
-                val isConnectionLost = (isHandshakeStale && noIncomingTraffic) ||
-                        (hasOutgoingTraffic && noIncomingTraffic && stats.lastHandshakeSec > 0L && (nowSec - stats.lastHandshakeSec) > 60)
+                val deltaTx = stats.txBytes - prevTxBytes
+                val deltaRx = stats.rxBytes - prevRxBytes
+                val timeSinceHandshake = if (stats.lastHandshakeSec > 0L) nowSec - stats.lastHandshakeSec else 999L
 
-                if (isConnectionLost) {
-                    staleCount++
-                    if (staleCount >= 3) { // 15 секунд подтвержденного отсутствия ответа
-                        Log.w(TAG, "WireGuard connection lost (handshake stale for ${nowSec - stats.lastHandshakeSec}s, no rx); auto-reconnecting...")
-                        TunnelManager.updateState(TunnelStatus.CONNECTING, "Восстановление соединения...")
-                        tunnelMutex.withLock {
-                            releaseTunnelLocked()
+                // Connection is lost if:
+                // 1. Rekey failed: last handshake was > 135s ago (normal rekey is every 120s) and rx is not moving
+                // OR
+                // 2. Dead downlink: client is sending packets (deltaTx > 0 or accumulated > 200 bytes),
+                //    but rx is completely frozen (deltaRx == 0) for multiple consecutive checks (>= 3 ticks = 12s),
+                //    and timeSinceHandshake > 25s.
+                // OR
+                // 3. Absolute freeze: handshake stale > 180s regardless of tx/rx
+                val isRekeyFailed = timeSinceHandshake > 135L && deltaRx <= 0L
+                val isDeadDownlink = (deltaTx > 0L || txSentDuringStale > 200L) && deltaRx <= 0L && timeSinceHandshake > 25L
+                val isHandshakeExpired = timeSinceHandshake > 180L
+
+                if (isRekeyFailed || isDeadDownlink || isHandshakeExpired) {
+                    staleTicks++
+                    if (deltaTx > 0L) {
+                        txSentDuringStale += deltaTx
+                    }
+                    val requiredTicks = when {
+                        isHandshakeExpired -> 2 // 8s
+                        isRekeyFailed -> 2      // 8s (rekey already failed for >15s)
+                        else -> 3               // 12s (confirmed 0 rx while sending packets)
+                    }
+
+                    if (staleTicks >= requiredTicks) {
+                        val reason = when {
+                            isHandshakeExpired -> "WireGuard handshake expired (${timeSinceHandshake}s ago, no rx)"
+                            isRekeyFailed -> "WireGuard rekey failed (${timeSinceHandshake}s since last handshake, no rx)"
+                            else -> "WireGuard downlink dead (sent ${txSentDuringStale}B, received 0B for ${staleTicks * 4}s)"
                         }
-                        delay(1500)
-                        if (isActive && !destroyed) {
-                            tunnelMutex.withLock {
-                                startTunnelLocked(profile, strategy, 0)
-                            }
-                        }
+                        triggerReconnect(
+                            profile,
+                            strategy,
+                            attempt = 0,
+                            message = "Восстановление соединения...",
+                            reason = reason
+                        )
                         return@launch
                     }
                 } else {
-                    staleCount = 0
+                    staleTicks = 0
+                    txSentDuringStale = 0L
                 }
 
                 prevTxBytes = stats.txBytes
                 prevRxBytes = stats.rxBytes
-                prevUidTx = curUidTx
             }
         }
     }
@@ -918,6 +975,8 @@ class TravonetVpnService : VpnService() {
     private fun stopTunnelAsync() {
         Log.i(TAG, "stopTunnelAsync requested")
         // 1. Immediately cancel active coroutines
+        reconnectJob?.cancel()
+        reconnectJob = null
         startJob?.cancel()
         healthJob?.cancel()
         statsJob?.cancel()
@@ -984,11 +1043,13 @@ class TravonetVpnService : VpnService() {
      *
      * @return the native handle that was released, or -1.
      */
-    private fun releaseTunnelLocked(): Int {
+    private fun releaseTunnelLocked(cancelWatchdog: Boolean = true): Int {
         releaseWakeLock()
         unregisterNetworkCallback()
-        healthJob?.cancel()
-        healthJob = null
+        if (cancelWatchdog) {
+            healthJob?.cancel()
+            healthJob = null
+        }
         statsJob?.cancel()
         statsJob = null
 
@@ -1068,6 +1129,8 @@ class TravonetVpnService : VpnService() {
 
     override fun onDestroy() {
         destroyed = true
+        reconnectJob?.cancel()
+        reconnectJob = null
         startJob?.cancel()
         releaseTunnelLocked()
         serviceReceiver?.let {

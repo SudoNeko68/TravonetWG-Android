@@ -1286,6 +1286,36 @@ class TravonetUnitTest {
         val sbRoute = com.travonet.wireguard.core.CoreRouter.route(singboxConf)
         assertEquals("VLESS (Reality)", sbRoute.detectedProtocol)
     }
+
+    @Test
+    fun testWatchdogDeadDownlinkDetection() {
+        fun evaluateConnectionStatus(
+            deltaTx: Long,
+            deltaRx: Long,
+            timeSinceHandshake: Long,
+            txSentDuringStale: Long
+        ): Boolean {
+            val isRekeyFailed = timeSinceHandshake > 135L && deltaRx <= 0L
+            val isDeadDownlink = (deltaTx > 0L || txSentDuringStale > 200L) && deltaRx <= 0L && timeSinceHandshake > 25L
+            val isHandshakeExpired = timeSinceHandshake > 180L
+            return isRekeyFailed || isDeadDownlink || isHandshakeExpired
+        }
+
+        // Healthy active connection: tx > 0 and rx > 0
+        assertFalse(evaluateConnectionStatus(deltaTx = 500, deltaRx = 1200, timeSinceHandshake = 10, txSentDuringStale = 0))
+
+        // Healthy idle connection: tx == 0 and rx == 0, handshake fresh
+        assertFalse(evaluateConnectionStatus(deltaTx = 0, deltaRx = 0, timeSinceHandshake = 45, txSentDuringStale = 0))
+
+        // Dead downlink: user sending traffic, but 0 bytes received
+        assertTrue(evaluateConnectionStatus(deltaTx = 300, deltaRx = 0, timeSinceHandshake = 35, txSentDuringStale = 0))
+
+        // Rekey failed: handshake older than 135s (normal rekey is 120s) and rx is 0
+        assertTrue(evaluateConnectionStatus(deltaTx = 0, deltaRx = 0, timeSinceHandshake = 140, txSentDuringStale = 0))
+
+        // Complete handshake expiration: > 180s
+        assertTrue(evaluateConnectionStatus(deltaTx = 0, deltaRx = 0, timeSinceHandshake = 185, txSentDuringStale = 0))
+    }
 }
 
 
