@@ -677,14 +677,14 @@ object ProxyConfigSynthesizer {
             val closeBracket = hostPart.indexOf(']')
             host = hostPart.substring(1, closeBracket)
             val colonIdx = hostPart.indexOf(':', closeBracket)
-            port = if (colonIdx >= 0) hostPart.substring(colonIdx + 1).trim().toIntOrNull() ?: 443 else 443
+            port = if (colonIdx >= 0) hostPart.substring(colonIdx + 1).trim().toIntOrNull() ?: -1 else -1
         } else if (hostPart.contains(":")) {
             val colonIdx = hostPart.lastIndexOf(':')
             host = hostPart.substring(0, colonIdx).trim()
-            port = hostPart.substring(colonIdx + 1).trim().toIntOrNull() ?: 443
+            port = hostPart.substring(colonIdx + 1).trim().toIntOrNull() ?: -1
         } else {
             host = hostPart.trim()
-            port = 443
+            port = -1
         }
 
         return Triple(auth, host, port)
@@ -766,7 +766,7 @@ object ProxyConfigSynthesizer {
                     val vnext = JSONArray().apply {
                         put(JSONObject().apply {
                             put("address", host)
-                            put("port", port)
+                            put("port", if (port > 0) port else 443)
                             put("users", users)
                         })
                     }
@@ -836,7 +836,7 @@ object ProxyConfigSynthesizer {
                 put("type", "vless")
                 put("tag", "proxy")
                 put("server", host)
-                put("server_port", port)
+                put("server_port", if (port > 0) port else 443)
                 put("uuid", uuid)
                 if (flow.isNotBlank()) put("flow", flow)
 
@@ -1009,7 +1009,7 @@ object ProxyConfigSynthesizer {
                 put("settings", JSONObject().apply {
                     put("servers", JSONArray().put(JSONObject().apply {
                         put("address", host)
-                        put("port", port)
+                        put("port", if (port > 0) port else 443)
                         put("password", password)
                     }))
                 })
@@ -1027,7 +1027,7 @@ object ProxyConfigSynthesizer {
                 put("type", "trojan")
                 put("tag", "proxy")
                 put("server", host)
-                put("server_port", port)
+                put("server_port", if (port > 0) port else 443)
                 put("password", password)
                 put("tls", JSONObject().apply {
                     put("enabled", true)
@@ -1093,7 +1093,7 @@ object ProxyConfigSynthesizer {
                 put("settings", JSONObject().apply {
                     put("servers", JSONArray().put(JSONObject().apply {
                         put("address", host)
-                        put("port", port)
+                        put("port", if (port > 0) port else 443)
                         put("method", method)
                         put("password", password)
                     }))
@@ -1107,7 +1107,7 @@ object ProxyConfigSynthesizer {
                 put("type", "shadowsocks")
                 put("tag", "proxy")
                 put("server", host)
-                put("server_port", port)
+                put("server_port", if (port > 0) port else 443)
                 put("method", method)
                 put("password", password)
             }
@@ -1142,7 +1142,7 @@ object ProxyConfigSynthesizer {
             put("type", "tuic")
             put("tag", "proxy")
             put("server", host)
-            put("server_port", port)
+            put("server_port", if (port > 0) port else 443)
             put("uuid", uuid)
             put("password", password)
             put("congestion_control", cc)
@@ -1186,7 +1186,9 @@ object ProxyConfigSynthesizer {
             put("server", host)
 
             val mport = params["mport"] ?: params["ports"] ?: params["server_ports"]
-            if (!mport.isNullOrBlank()) {
+            if (port > 0) {
+                put("server_port", port)
+            } else if (!mport.isNullOrBlank()) {
                 val portsArray = JSONArray()
                 mport.split(",").map { it.trim() }.filter { it.isNotEmpty() }.forEach { p ->
                     val formatted = if (p.contains("-")) {
@@ -1200,7 +1202,7 @@ object ProxyConfigSynthesizer {
                 }
                 put("server_ports", portsArray)
             } else {
-                put("server_port", port)
+                put("server_port", 443)
             }
 
             put("password", password)
@@ -1275,7 +1277,7 @@ object ProxyConfigSynthesizer {
             put("type", "shadowtls")
             put("tag", "proxy")
             put("server", host)
-            put("server_port", port)
+            put("server_port", if (port > 0) port else 443)
             put("password", password)
             put("tls", JSONObject().apply {
                 put("enabled", true)

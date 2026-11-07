@@ -649,7 +649,7 @@ class TravonetUnitTest {
         assertTrue(hy2Config.contains("\"type\": \"hysteria2\"") || hy2Config.contains("\"type\":\"hysteria2\""))
         assertTrue(hy2Config.contains("superpass"))
 
-        val hy2AdvancedUrl = "hy2://my%20secret@hy2.server.com:8443/?sni=cdn.example.com&obfs=salamander&obfs-password=salapass&mport=20000-30000&up=50m&down=100m&insecure=1#AdvHy2"
+        val hy2AdvancedUrl = "hy2://my%20secret@hy2.server.com/?sni=cdn.example.com&obfs=salamander&obfs-password=salapass&mport=20000-30000&up=50m&down=100m&insecure=1#AdvHy2"
         val hy2AdvConfig = com.travonet.wireguard.parser.ProxyConfigSynthesizer.synthesize(
             hy2AdvancedUrl,
             com.travonet.wireguard.core.CoreType.SINGBOX
@@ -662,6 +662,14 @@ class TravonetUnitTest {
         assertTrue(hy2AdvConfig.contains("\"up_mbps\": 50"))
         assertTrue(hy2AdvConfig.contains("\"down_mbps\": 100"))
         assertTrue(hy2AdvConfig.contains("\"insecure\": true"))
+
+        val userHy2 = "hysteria2://96cnnn2l15wkvmui@z.travonet.ru:56213?alpn=h3&fp=firefox&mport=20000-50000&obfs=salamander&obfs-password=kbwhuzdh2bw3pdpi&security=tls&sni=travonet.ddns.net#Hysteria%202"
+        val userHy2Config = com.travonet.wireguard.parser.ProxyConfigSynthesizer.synthesize(
+            userHy2,
+            com.travonet.wireguard.core.CoreType.SINGBOX
+        )
+        assertTrue(userHy2Config.contains("\"server_port\": 56213"))
+        assertFalse(userHy2Config.contains("20000:50000"))
     }
 
     @Test
