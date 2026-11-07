@@ -68,7 +68,7 @@ class CoreManager(private val context: Context) {
         val singboxEntry = manifest.cores.find { it.id == CoreType.SINGBOX.id }
         val freeturnEntry = manifest.cores.find { it.id == CoreType.FREETURN.id }
 
-        val travonetAvailVersions = (travonetEntry?.versions?.map { it.version } ?: listOf(BUILTIN_TRAVONET_VERSION))
+        val travonetAvailVersions = (travonetEntry?.versions?.map { it.version } ?: listOf(BUILTIN_TRAVONET_VERSION, "1.2.0"))
             .distinct()
         val xrayAvailVersions = (xrayEntry?.versions?.map { it.version } ?: listOf(BUILTIN_XRAY_VERSION, "1.8.23"))
             .distinct()

@@ -40,8 +40,8 @@ android {
         applicationId = "com.travonet.vpn"
         minSdk = 28
         targetSdk = 37
-        versionCode = 1207
-        versionName = "1.2.0-7"
+        versionCode = 2000
+        versionName = "2.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 

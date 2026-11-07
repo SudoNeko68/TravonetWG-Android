@@ -290,7 +290,7 @@ object SubscriptionFetcher {
         conn.connectTimeout = 15000
         conn.readTimeout = 15000
         conn.instanceFollowRedirects = true
-        conn.setRequestProperty("User-Agent", "TravonetVPN-Android/1.2.0")
+        conn.setRequestProperty("User-Agent", "TravonetVPN-Android/2.0")
         conn.setRequestProperty("Accept", "*/*")
 
         if (conn is HttpsURLConnection) {

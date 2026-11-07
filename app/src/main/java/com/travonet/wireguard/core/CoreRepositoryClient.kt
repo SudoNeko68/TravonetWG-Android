@@ -61,7 +61,7 @@ object CoreRepositoryClient {
             val conn = (url.openConnection() as HttpURLConnection).apply {
                 connectTimeout = 6000
                 readTimeout = 10000
-                setRequestProperty("User-Agent", "TravonetVPN-CoreLoader/1.2.0")
+                setRequestProperty("User-Agent", "TravonetVPN-CoreLoader/2.0")
                 setRequestProperty("Accept", "application/json")
             }
 
@@ -106,7 +106,7 @@ object CoreRepositoryClient {
             val conn = (downloadUrl.openConnection() as HttpURLConnection).apply {
                 connectTimeout = 10000
                 readTimeout = 30000
-                setRequestProperty("User-Agent", "TravonetVPN-CoreLoader/1.2.0")
+                setRequestProperty("User-Agent", "TravonetVPN-CoreLoader/2.0")
             }
 
             if (conn.responseCode !in 200..299) {
@@ -230,15 +230,26 @@ object CoreRepositoryClient {
                     id = "travonet_wg",
                     name = "TravonetWG",
                     binaryName = "libtravonet-wg.so",
-                    latestVersion = "1.2.0",
+                    latestVersion = "1.3",
                     versions = listOf(
+                        RemoteCoreVersion(
+                            version = "1.3",
+                            date = "2026-11-07",
+                            abis = mapOf(
+                                "arm64-v8a" to RemoteCoreAbi("$base/travonet_wg/1.3/arm64-v8a/libtravonet-wg.so"),
+                                "armeabi-v7a" to RemoteCoreAbi("$base/travonet_wg/1.3/armeabi-v7a/libtravonet-wg.so"),
+                                "x86_64" to RemoteCoreAbi("$base/travonet_wg/1.3/x86_64/libtravonet-wg.so"),
+                                "x86" to RemoteCoreAbi("$base/travonet_wg/1.3/x86/libtravonet-wg.so")
+                            )
+                        ),
                         RemoteCoreVersion(
                             version = "1.2.0",
                             date = "2024-11-04",
                             abis = mapOf(
                                 "arm64-v8a" to RemoteCoreAbi("$base/travonet_wg/1.2.0/arm64-v8a/libtravonet-wg.so"),
                                 "armeabi-v7a" to RemoteCoreAbi("$base/travonet_wg/1.2.0/armeabi-v7a/libtravonet-wg.so"),
-                                "x86_64" to RemoteCoreAbi("$base/travonet_wg/1.2.0/x86_64/libtravonet-wg.so")
+                                "x86_64" to RemoteCoreAbi("$base/travonet_wg/1.2.0/x86_64/libtravonet-wg.so"),
+                                "x86" to RemoteCoreAbi("$base/travonet_wg/1.2.0/x86/libtravonet-wg.so")
                             )
                         )
                     )
